@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# Voice typing launcher with RealtimeSTT
+
+# Default to small model for better accuracy
+DEFAULT_ARGS=""
+if [ $# -eq 0 ]; then
+    DEFAULT_ARGS="--model small"
+    echo "Using 'small' model for better accuracy"
+    echo "Options: tiny (fastest), base, small, medium, large-v2, large-v3 (most accurate)"
+fi
+
+# Check if we need to download the model first
+MODEL_DIR="$HOME/.cache/whisper"
+if [ ! -d "$MODEL_DIR" ]; then
+    echo "First run: Whisper will download the model"
+    echo "Small model = ~244MB (recommended for accuracy)"
+    echo "This only happens once."
+fi
+
+# Check session type for informational purposes
+if [ "$XDG_SESSION_TYPE" = "wayland" ]; then
+    echo "Running on Wayland - will try ydotool, pyautogui, then xdotool"
+    # Check if the ydotool service is running
+    if ! systemctl is-active --quiet ydotoold; then
+        echo "Note: ydotoold service is not running, will use fallback methods"
+    fi
+elif [ "$XDG_SESSION_TYPE" = "x11" ]; then
+    echo "Running on X11 - will use pyautogui or xdotool"
+fi
+
+# Run enhanced version (with pre-buffer to capture initial words)
+cd /home/jordan/voice-typing-nix
+exec nix-shell shell.nix --run "python enhanced-voice-typing.py $DEFAULT_ARGS $*"
