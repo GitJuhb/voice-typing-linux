@@ -41,7 +41,7 @@ Press Ctrl+C to stop
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/yourusername/voice-typing-linux.git
+git clone https://github.com/GitJuhb/voice-typing-linux.git
 cd voice-typing-linux
 ```
 
