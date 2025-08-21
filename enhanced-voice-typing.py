@@ -112,7 +112,7 @@ class VoiceTyping:
         """Type the text using ydotool or xdotool"""
         try:
             # Try ydotool first
-            subprocess.run(['ydotool', '--socket-path', '/run/ydotoold/socket', 'type', text + ' '], 
+            subprocess.run(['ydotool', 'type', '-d1', '-H1', text + ' '],
                          capture_output=True, text=True, check=True)
             print(f"✓ {text}")
         except:

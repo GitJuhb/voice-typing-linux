@@ -29,5 +29,5 @@ elif [ "$XDG_SESSION_TYPE" = "x11" ]; then
 fi
 
 # Run enhanced version (with pre-buffer to capture initial words)
-cd /home/jordan/voice-typing-nix
-exec nix-shell shell.nix --run "python enhanced-voice-typing.py $DEFAULT_ARGS $*"
+cd "$(dirname "$0")"
+YDOTOOL_SOCKET=/run/ydotoold/socket exec nix-shell shell.nix --run "python enhanced-voice-typing.py $DEFAULT_ARGS $*"
