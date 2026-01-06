@@ -49,4 +49,7 @@ test-*.py
 
 # Temporary files
 tmp/
-temp/
+temp/logs/
+sqlite
+.venv/
+__pycache__/
