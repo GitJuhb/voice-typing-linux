@@ -1530,50 +1530,6 @@ def main():
         viz_hide_delay=args.viz_hide_delay,
     )
 
-    # Device selection
-    if args.device == 'auto':
-        try:
-            import torch
-            if torch.cuda.is_available():
-                args.device = 'cuda'
-                print("CUDA available, using GPU")
-            else:
-                args.device = 'cpu'
-                print("CUDA not available, using CPU")
-        except ImportError:
-            print("PyTorch not installed, using CPU")
-            args.device = 'cpu'
-
-    # Create default commands config if commands enabled
-    if args.commands and COMMANDS_AVAILABLE:
-        create_default_config(args.commands_file)
-
-    # Run voice typing
-    vt = VoiceTyping(
-        model_size=args.model,
-        device=args.device,
-        language=args.language,
-        hotkey=args.hotkey,
-        commands_enabled=args.commands,
-        commands_file=args.commands_file,
-        require_command_arm=args.command_arm,
-        command_arm_seconds=args.command_arm_seconds,
-        allow_shell_commands=args.allow_shell,
-        max_recording_seconds=args.max_seconds,
-        queue_size=args.queue_size,
-        calibration_seconds=args.calibrate_seconds,
-        noise_gate_enabled=args.noise_gate,
-        noise_gate_multiplier=args.noise_gate_multiplier,
-        agc_enabled=args.agc,
-        agc_target_rms=args.agc_target_rms,
-        agc_min_gain=args.agc_min_gain,
-        agc_max_gain=args.agc_max_gain,
-        adaptive_vad=not args.no_adaptive_vad,
-        command_min_confidence=args.command_min_confidence,
-        command_confirm_below=args.command_confirm_below,
-        command_confirm_seconds=args.command_confirm_seconds
-    )
-
     # Handle graceful shutdown
     def signal_handler(sig, frame):
         print("\n\nShutting down...")

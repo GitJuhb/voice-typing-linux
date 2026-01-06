@@ -14,6 +14,17 @@ import os
 # Check display server
 DISPLAY_SERVER = os.environ.get('XDG_SESSION_TYPE', 'x11')
 
+# Pre-load GTK4 layer-shell BEFORE GTK4 (required for proper initialization)
+LAYER_SHELL_AVAILABLE = False
+if DISPLAY_SERVER == 'wayland':
+    try:
+        import gi
+        gi.require_version('Gtk4LayerShell', '1.0')
+        from gi.repository import Gtk4LayerShell
+        LAYER_SHELL_AVAILABLE = True
+    except Exception:
+        pass
+
 
 class AudioVisualizer:
     """GTK4 layer-shell spectrum analyzer overlay for voice activity visualization."""
@@ -161,22 +172,27 @@ class AudioVisualizer:
         total_width = self.num_bars * (self.bar_width + self.bar_gap) - self.bar_gap + 20
         self.window.set_default_size(total_width, self.window_height)
 
-        # Try layer-shell for Wayland
+        # Try layer-shell for Wayland (wlroots compositors: Sway, Hyprland, etc.)
         use_layer_shell = False
-        if DISPLAY_SERVER == 'wayland':
+        if LAYER_SHELL_AVAILABLE:
             try:
-                gi.require_version('Gtk4LayerShell', '1.0')
-                from gi.repository import Gtk4LayerShell as LayerShell
-
-                LayerShell.init_for_window(self.window)
-                LayerShell.set_layer(self.window, LayerShell.Layer.OVERLAY)
-                LayerShell.set_namespace(self.window, "voice-typing-viz")
-                LayerShell.set_keyboard_mode(self.window, LayerShell.KeyboardMode.NONE)
-
-                self._apply_layer_shell_position(LayerShell)
-                use_layer_shell = True
+                if Gtk4LayerShell.is_supported():
+                    Gtk4LayerShell.init_for_window(self.window)
+                    Gtk4LayerShell.set_layer(self.window, Gtk4LayerShell.Layer.OVERLAY)
+                    Gtk4LayerShell.set_namespace(self.window, "voice-typing-viz")
+                    Gtk4LayerShell.set_keyboard_mode(self.window, Gtk4LayerShell.KeyboardMode.NONE)
+                    self._apply_layer_shell_position(Gtk4LayerShell)
+                    use_layer_shell = True
+                else:
+                    print("Note: Layer-shell not supported (GNOME?). Using floating window.")
             except Exception as e:
-                print(f"Layer-shell unavailable, using regular window: {e}")
+                print(f"Layer-shell init failed: {e}")
+
+        # Fallback: floating window (GNOME, KDE, X11)
+        if not use_layer_shell:
+            # Request floating/utility window hints
+            self.window.set_deletable(False)
+            self.window.set_focus_on_click(False)
 
         # Drawing area for spectrum
         self.drawing_area = Gtk.DrawingArea()
@@ -204,28 +220,27 @@ class AudioVisualizer:
         self.window.set_visible(False)
         self.visible = False
 
-    def _apply_layer_shell_position(self, LayerShell):
+    def _apply_layer_shell_position(self, ls):
         """Set window anchors based on position config."""
         # Clear all anchors
-        for edge in [LayerShell.Edge.TOP, LayerShell.Edge.BOTTOM,
-                     LayerShell.Edge.LEFT, LayerShell.Edge.RIGHT]:
-            LayerShell.set_anchor(self.window, edge, False)
-            LayerShell.set_margin(self.window, edge, 0)
+        for edge in [ls.Edge.TOP, ls.Edge.BOTTOM, ls.Edge.LEFT, ls.Edge.RIGHT]:
+            ls.set_anchor(self.window, edge, False)
+            ls.set_margin(self.window, edge, 0)
 
         # Apply position
         if "top" in self.position:
-            LayerShell.set_anchor(self.window, LayerShell.Edge.TOP, True)
-            LayerShell.set_margin(self.window, LayerShell.Edge.TOP, self.margin)
+            ls.set_anchor(self.window, ls.Edge.TOP, True)
+            ls.set_margin(self.window, ls.Edge.TOP, self.margin)
         else:
-            LayerShell.set_anchor(self.window, LayerShell.Edge.BOTTOM, True)
-            LayerShell.set_margin(self.window, LayerShell.Edge.BOTTOM, self.margin)
+            ls.set_anchor(self.window, ls.Edge.BOTTOM, True)
+            ls.set_margin(self.window, ls.Edge.BOTTOM, self.margin)
 
         if "left" in self.position:
-            LayerShell.set_anchor(self.window, LayerShell.Edge.LEFT, True)
-            LayerShell.set_margin(self.window, LayerShell.Edge.LEFT, self.margin)
+            ls.set_anchor(self.window, ls.Edge.LEFT, True)
+            ls.set_margin(self.window, ls.Edge.LEFT, self.margin)
         else:
-            LayerShell.set_anchor(self.window, LayerShell.Edge.RIGHT, True)
-            LayerShell.set_margin(self.window, LayerShell.Edge.RIGHT, self.margin)
+            ls.set_anchor(self.window, ls.Edge.RIGHT, True)
+            ls.set_margin(self.window, ls.Edge.RIGHT, self.margin)
 
     def _update_speaking_state(self, is_speaking: bool):
         """GTK thread: update visibility based on speech."""
