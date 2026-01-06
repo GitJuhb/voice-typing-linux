@@ -1,0 +1,26 @@
+#!/bin/bash
+# Toggle voice typing pause/resume via Unix socket
+# Use this for Wayland or bind to a hotkey in your compositor
+
+RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}"
+SOCKET="${RUNTIME_DIR}/voice-typing-$(id -u).sock"
+TOKEN_FILE="${RUNTIME_DIR}/voice-typing-$(id -u).token"
+
+if [ ! -S "$SOCKET" ]; then
+    echo "Voice typing not running (socket not found)"
+    exit 1
+fi
+
+if [ -f "$TOKEN_FILE" ]; then
+    TOKEN="$(cat "$TOKEN_FILE")"
+    echo "toggle $TOKEN" | nc -U "$SOCKET" 2>/dev/null
+else
+    echo "toggle" | nc -U "$SOCKET" 2>/dev/null
+fi
+
+if [ $? -eq 0 ]; then
+    echo "Toggled pause/resume"
+else
+    echo "Failed to send command"
+    exit 1
+fi

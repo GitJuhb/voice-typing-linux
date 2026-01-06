@@ -17,7 +17,7 @@ A fast, accurate voice typing solution for Linux that works seamlessly on both W
 $ voice
 Using 'small' model for better accuracy
 Options: tiny (fastest), base, small, medium, large-v2, large-v3 (most accurate)
-Running on Wayland - will try ydotool, pyautogui, then xdotool
+Running on Wayland - will use ydotool (requires ydotoold)
 Auto-detected device: cpu
 
 🎤 Enhanced voice typing active!
@@ -101,6 +101,9 @@ ydotoold &
 sudo systemctl enable --now ydotoold
 ```
 
+**Wayland note:** Pause/resume uses a per-user socket and token in
+`${XDG_RUNTIME_DIR:-/tmp}`. `./voice-toggle` handles this automatically.
+
 ## 📖 Usage
 
 ### Basic Usage
@@ -117,6 +120,87 @@ voice --model large   # Most accurate
 # Use GPU acceleration (if available)
 voice --device cuda
 ```
+
+### Safety & Reliability Options
+
+```bash
+# Require "command mode" before executing voice commands
+voice --commands --command-arm --command-arm-seconds 10
+
+# Ask for confirmation when confidence is low
+voice --commands --command-min-confidence 0.8 --command-confirm-below 0.9
+
+# Allow custom shell commands from commands.yaml
+voice --commands --allow-shell
+
+# Limit max chunk length and queue depth (reduce memory spikes)
+voice --max-seconds 20 --queue-size 2
+
+# Noise calibration + noise gate + AGC
+voice --calibrate-seconds 1.0 --noise-gate --noise-gate-multiplier 1.5
+voice --agc --agc-target-rms 4000
+
+# Push-to-talk (hold or toggle)
+voice --ptt --ptt-hotkey f9 --ptt-mode hold
+
+# Input device selection
+voice --list-devices
+voice --input-device 2
+voice --input-device "USB Microphone"
+
+# Status + notifications
+voice --status-interval 2 --notify
+```
+
+## ⚙️ Configuration
+
+Default config: `${XDG_CONFIG_HOME:-~/.config}/voice-typing/config.yaml`
+
+Example:
+```yaml
+model: small
+device: auto
+commands: true
+command_arm: true
+command_arm_seconds: 10
+noise_gate: true
+agc: true
+adaptive_vad: true
+ptt: false
+status_interval: 2
+```
+
+Environment overrides (prefix `VOICE_`): `VOICE_MODEL`, `VOICE_DEVICE`, `VOICE_HOTKEY`,
+`VOICE_COMMANDS`, `VOICE_NOISE_GATE`, `VOICE_PTT`, `VOICE_LOG_FILE`,
+`VOICE_ADAPTIVE_VAD` (or legacy `VOICE_NO_ADAPTIVE_VAD`).
+
+## 🧾 Logs
+
+Rotating log file defaults to:
+`${XDG_STATE_HOME:-~/.local/state}/voice-typing/voice-typing.log`
+
+Configure via:
+```bash
+voice --log-file ~/.local/state/voice-typing/voice-typing.log --log-max-bytes 1000000 --log-backups 5
+```
+
+## 🧰 systemd user service
+
+Template: `systemd/voice-typing.service` (edit paths if needed)
+```bash
+systemctl --user enable --now /path/to/repo/systemd/voice-typing.service
+```
+
+## 📦 pipx
+
+```bash
+pipx install .
+voice
+```
+
+## ❄️ Nix module
+
+See `nix/voice-typing.nix` for a minimal module.
 
 ### Available Models
 

@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Voice typing launcher with RealtimeSTT
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
 # Default to small model for better accuracy
 DEFAULT_ARGS=""
 if [ $# -eq 0 ]; then
@@ -19,15 +21,14 @@ fi
 
 # Check session type for informational purposes
 if [ "$XDG_SESSION_TYPE" = "wayland" ]; then
-    echo "Running on Wayland - will try ydotool, pyautogui, then xdotool"
+    echo "Running on Wayland - will use ydotool (requires ydotoold)"
     # Check if the ydotool service is running
     if ! systemctl is-active --quiet ydotoold; then
-        echo "Note: ydotoold service is not running, will use fallback methods"
+        echo "Note: ydotoold service is not running; keyboard input will not work"
     fi
 elif [ "$XDG_SESSION_TYPE" = "x11" ]; then
-    echo "Running on X11 - will use pyautogui or xdotool"
+    echo "Running on X11 - will use xdotool"
 fi
 
 # Run enhanced version (with pre-buffer to capture initial words)
-cd /home/jordan/voice-typing-nix
-exec nix-shell shell.nix --run "python enhanced-voice-typing.py $DEFAULT_ARGS $*"
+exec nix-shell "$SCRIPT_DIR/shell.nix" --run "python \"$SCRIPT_DIR/enhanced-voice-typing.py\" $DEFAULT_ARGS $*"
