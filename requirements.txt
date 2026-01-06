@@ -6,11 +6,12 @@ webrtcvad==2.0.10
 
 # Optional but recommended
 torch>=2.0.0  # For GPU support
+pynput>=1.7.6  # Global hotkey support
+pyyaml>=6.0  # Custom voice commands config
 pyautogui>=0.9.54  # Alternative keyboard input
 python-xlib>=0.33  # Required by pyautogui on Linux
 pillow>=10.0.0  # For pyautogui screenshots
 
-# Threading and utilities
-threading  # Built-in
-queue  # Built-in
-collections  # Built-in
+# Audio visualization (GTK4 overlay)
+PyGObject>=3.42.0  # GTK4 Python bindings
+pycairo>=1.24.0    # Cairo drawing

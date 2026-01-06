@@ -12,6 +12,9 @@ pkgs.mkShell {
     sox
     ydotool
     xdotool
+    wmctrl     # Window focus commands
+    netcat     # Socket toggle (voice-toggle)
+    xbindkeys  # Wayland hotkey fallback
     portaudio  # For pyaudio
     
     # For pyautogui
@@ -19,7 +22,16 @@ pkgs.mkShell {
     xorg.libX11
     xorg.libXext
     xorg.libXinerama
-    
+
+    # Audio visualization (GTK4 layer-shell overlay)
+    gtk4
+    gtk4-layer-shell
+    gobject-introspection
+    glib
+    cairo
+    python311Packages.pygobject3
+    python311Packages.pycairo
+
     # Build dependencies
     gcc
     pkg-config
@@ -30,6 +42,9 @@ pkgs.mkShell {
   shellHook = ''
     # Set up library paths
     export LD_LIBRARY_PATH="${pkgs.stdenv.cc.cc.lib}/lib:${pkgs.zlib}/lib:$LD_LIBRARY_PATH"
+
+    # GTK4 layer-shell typelib path
+    export GI_TYPELIB_PATH="${pkgs.gtk4}/lib/girepository-1.0:${pkgs.gtk4-layer-shell}/lib/girepository-1.0:${pkgs.glib.out}/lib/girepository-1.0:$GI_TYPELIB_PATH"
     
     # Create virtual environment if it doesn't exist
     if [ ! -d .venv ]; then
@@ -40,26 +55,30 @@ pkgs.mkShell {
     # Activate virtual environment
     source .venv/bin/activate
     
-    # Install Python packages
-    echo "Installing/updating Python packages..."
+    # Install Python packages only when requirements change
+    echo "Checking Python packages..."
     pip install --upgrade pip
-    
-    # Install RealtimeSTT and dependencies
-    pip install RealtimeSTT
-    pip install faster-whisper
-    pip install pyautogui
-    pip install python-xlib  # Required by pyautogui on Linux
-    pip install pillow       # For pyautogui screenshots
-    pip install opencv-python-headless  # Optional for pyautogui
-    
-    # Install torch (CPU version by default, comment out and use CUDA version if needed)
-    pip install torch --index-url https://download.pytorch.org/whl/cpu
-    # For CUDA: pip install torch --index-url https://download.pytorch.org/whl/cu118
+
+    if [ -f requirements.txt ]; then
+      REQ_HASH="$(sha256sum requirements.txt | awk '{print $1}')"
+      REQ_FILE=".venv/.requirements.sha"
+      if [ ! -f "$REQ_FILE" ] || [ "$(cat "$REQ_FILE")" != "$REQ_HASH" ]; then
+        echo "Installing/updating Python packages..."
+        pip install -r requirements.txt
+        echo "$REQ_HASH" > "$REQ_FILE"
+      fi
+    fi
+
+    # Optional CUDA torch install (set VOICE_TYPING_CUDA=1)
+    if [ -n "$VOICE_TYPING_CUDA" ]; then
+      # Using CUDA 12.4 - driver 570.x supports CUDA 12.8.1 per research
+      pip install torch --index-url https://download.pytorch.org/whl/cu124
+    fi
     
     echo ""
     echo "Voice typing environment ready!"
-    echo "Run: python realtime-voice-typing.py"
-    echo "Or: python realtime-voice-typing.py --model base --device cuda"
+    echo "Run: python enhanced-voice-typing.py"
+    echo "Or: python enhanced-voice-typing.py --model base --device cuda"
     echo ""
   '';
 }
