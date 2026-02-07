@@ -33,6 +33,7 @@ from faster_whisper import WhisperModel
 # Voice command support
 try:
     from commands import CommandDetector, CommandExecutor, create_default_config
+
     COMMANDS_AVAILABLE = True
 except ImportError:
     COMMANDS_AVAILABLE = False
@@ -40,6 +41,7 @@ except ImportError:
 # GPU optimization imports
 try:
     import torch
+
     TORCH_AVAILABLE = True
 except ImportError:
     TORCH_AVAILABLE = False
@@ -47,6 +49,7 @@ except ImportError:
 # Hotkey support (optional)
 try:
     from pynput import keyboard
+
     PYNPUT_AVAILABLE = True
 except ImportError:
     PYNPUT_AVAILABLE = False
@@ -54,29 +57,38 @@ except ImportError:
 # Audio visualization (optional)
 try:
     from audio_visualizer import AudioVisualizer
+
     VISUALIZER_AVAILABLE = True
 except ImportError:
     VISUALIZER_AVAILABLE = False
 
+# Streaming STT (optional - sherpa-onnx)
+try:
+    from streaming_stt import StreamingSTT
+
+    STREAMING_AVAILABLE = True
+except ImportError:
+    STREAMING_AVAILABLE = False
+
 # Hotkey name to pynput format mapping
 HOTKEY_MAP = {
-    'f12': '<f12>',
-    'f11': '<f11>',
-    'f10': '<f10>',
-    'scroll_lock': '<scroll_lock>',
-    'pause': '<pause>',
+    "f12": "<f12>",
+    "f11": "<f11>",
+    "f10": "<f10>",
+    "scroll_lock": "<scroll_lock>",
+    "pause": "<pause>",
 }
 
 # Socket for Wayland fallback (per-user, permissioned)
-RUNTIME_DIR = os.environ.get('XDG_RUNTIME_DIR', '/tmp')
+RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR", "/tmp")
 SOCKET_PATH = os.path.join(RUNTIME_DIR, f"voice-typing-{os.getuid()}.sock")
 TOKEN_PATH = os.path.join(RUNTIME_DIR, f"voice-typing-{os.getuid()}.token")
 
-XDG_CONFIG_HOME = os.environ.get('XDG_CONFIG_HOME', os.path.expanduser('~/.config'))
-XDG_STATE_HOME = os.environ.get('XDG_STATE_HOME', os.path.expanduser('~/.local/state'))
-DEFAULT_CONFIG_PATH = os.path.join(XDG_CONFIG_HOME, 'voice-typing', 'config.yaml')
-DEFAULT_LOG_DIR = os.path.join(XDG_STATE_HOME, 'voice-typing')
-DEFAULT_LOG_FILE = os.path.join(DEFAULT_LOG_DIR, 'voice-typing.log')
+XDG_CONFIG_HOME = os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config"))
+XDG_STATE_HOME = os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state"))
+DEFAULT_CONFIG_PATH = os.path.join(XDG_CONFIG_HOME, "voice-typing", "config.yaml")
+DEFAULT_LOG_DIR = os.path.join(XDG_STATE_HOME, "voice-typing")
+DEFAULT_LOG_FILE = os.path.join(DEFAULT_LOG_DIR, "voice-typing.log")
 
 CONFIG_DEFAULTS = {
     "model": "base",
@@ -115,6 +127,10 @@ CONFIG_DEFAULTS = {
     "viz": False,
     "viz_position": "bottom-right",
     "viz_hide_delay": 1500,
+    "streaming": False,
+    "streaming_model": "zipformer-en",
+    "refinement": False,
+    "refinement_model": "large-v3-turbo",
 }
 
 
@@ -130,17 +146,18 @@ def _load_config(path: str) -> dict:
         return {}
 
     try:
-        if path.endswith(('.yaml', '.yml')):
+        if path.endswith((".yaml", ".yml")):
             try:
                 import yaml
-                with open(path, 'r') as f:
+
+                with open(path, "r") as f:
                     data = yaml.safe_load(f) or {}
                     return data if isinstance(data, dict) else {}
             except Exception as e:
                 print(f"⚠️  Failed to load YAML config: {e}")
                 return {}
-        if path.endswith('.json'):
-            with open(path, 'r') as f:
+        if path.endswith(".json"):
+            with open(path, "r") as f:
                 data = json.load(f)
                 return data if isinstance(data, dict) else {}
     except Exception as e:
@@ -187,6 +204,10 @@ def _apply_env_overrides(config: dict) -> dict:
         "viz": "VOICE_VIZ",
         "viz_position": "VOICE_VIZ_POSITION",
         "viz_hide_delay": "VOICE_VIZ_HIDE_DELAY",
+        "streaming": "VOICE_STREAMING",
+        "streaming_model": "VOICE_STREAMING_MODEL",
+        "refinement": "VOICE_REFINEMENT",
+        "refinement_model": "VOICE_REFINEMENT_MODEL",
     }
 
     for key, env_var in mapping.items():
@@ -201,15 +222,40 @@ def _apply_env_overrides(config: dict) -> dict:
 
     merged = dict(config)
     for key, value in overrides.items():
-        if key in ("commands", "command_arm", "allow_shell", "noise_gate", "agc",
-                   "notify", "ptt", "adaptive_vad", "viz"):
+        if key in (
+            "commands",
+            "command_arm",
+            "allow_shell",
+            "noise_gate",
+            "agc",
+            "notify",
+            "ptt",
+            "adaptive_vad",
+            "viz",
+            "streaming",
+            "refinement",
+        ):
             merged[key] = _parse_bool(value)
-        elif key in ("command_arm_seconds", "max_seconds", "queue_size", "log_max_bytes", "log_backups",
-                     "viz_hide_delay"):
+        elif key in (
+            "command_arm_seconds",
+            "max_seconds",
+            "queue_size",
+            "log_max_bytes",
+            "log_backups",
+            "viz_hide_delay",
+        ):
             merged[key] = int(value)
-        elif key in ("command_min_confidence", "command_confirm_below", "command_confirm_seconds",
-                     "calibrate_seconds", "noise_gate_multiplier", "agc_target_rms", "agc_min_gain",
-                     "agc_max_gain", "status_interval"):
+        elif key in (
+            "command_min_confidence",
+            "command_confirm_below",
+            "command_confirm_seconds",
+            "calibrate_seconds",
+            "noise_gate_multiplier",
+            "agc_target_rms",
+            "agc_min_gain",
+            "agc_max_gain",
+            "status_interval",
+        ):
             merged[key] = float(value)
         else:
             merged[key] = value
@@ -217,7 +263,9 @@ def _apply_env_overrides(config: dict) -> dict:
     return merged
 
 
-def _setup_logging(log_file: str, level: str = "INFO", max_bytes: int = 1_000_000, backups: int = 5):
+def _setup_logging(
+    log_file: str, level: str = "INFO", max_bytes: int = 1_000_000, backups: int = 5
+):
     if not log_file:
         return None
 
@@ -237,35 +285,63 @@ def _setup_logging(log_file: str, level: str = "INFO", max_bytes: int = 1_000_00
 
 def detect_display_server():
     """Detect if running on Wayland or X11"""
-    session_type = os.environ.get('XDG_SESSION_TYPE', '').lower()
-    wayland_display = os.environ.get('WAYLAND_DISPLAY', '')
+    session_type = os.environ.get("XDG_SESSION_TYPE", "").lower()
+    wayland_display = os.environ.get("WAYLAND_DISPLAY", "")
 
-    if session_type == 'wayland' or wayland_display:
-        return 'wayland'
-    return 'x11'
+    if session_type == "wayland" or wayland_display:
+        return "wayland"
+    return "x11"
 
 
 def check_ydotool_daemon():
     """Check if ydotool daemon is running (required for Wayland)"""
     try:
-        result = subprocess.run(['pgrep', '-x', 'ydotoold'], capture_output=True)
+        result = subprocess.run(["pgrep", "-x", "ydotoold"], capture_output=True)
         return result.returncode == 0
     except:
         return False
 
 
 class VoiceTyping:
-    def __init__(self, model_size='base', device='cpu', language=None, hotkey='f12',
-                 commands_enabled=False, commands_file=None, require_command_arm=False,
-                 command_arm_seconds=10, allow_shell_commands=False, max_recording_seconds=30,
-                 queue_size=2, calibration_seconds=1.0, noise_gate_enabled=False,
-                 noise_gate_multiplier=1.5, agc_enabled=False, agc_target_rms=4000.0,
-                 agc_min_gain=0.5, agc_max_gain=3.0, adaptive_vad=True,
-                 command_min_confidence=0.8, command_confirm_below=0.9,
-                 command_confirm_seconds=5.0, input_device=None, notify=False,
-                 status_interval=0.0, ptt_enabled=False, ptt_hotkey='f9',
-                 ptt_mode='hold', logger=None, viz_enabled=False,
-                 viz_position='bottom-right', viz_hide_delay=1500):
+    def __init__(
+        self,
+        model_size="base",
+        device="cpu",
+        language=None,
+        hotkey="f12",
+        commands_enabled=False,
+        commands_file=None,
+        require_command_arm=False,
+        command_arm_seconds=10,
+        allow_shell_commands=False,
+        max_recording_seconds=30,
+        queue_size=2,
+        calibration_seconds=1.0,
+        noise_gate_enabled=False,
+        noise_gate_multiplier=1.5,
+        agc_enabled=False,
+        agc_target_rms=4000.0,
+        agc_min_gain=0.5,
+        agc_max_gain=3.0,
+        adaptive_vad=True,
+        command_min_confidence=0.8,
+        command_confirm_below=0.9,
+        command_confirm_seconds=5.0,
+        input_device=None,
+        notify=False,
+        status_interval=0.0,
+        ptt_enabled=False,
+        ptt_hotkey="f9",
+        ptt_mode="hold",
+        logger=None,
+        viz_enabled=False,
+        viz_position="bottom-right",
+        viz_hide_delay=1500,
+        streaming_enabled=False,
+        streaming_model="zipformer-en",
+        refinement_enabled=False,
+        refinement_model="large-v3-turbo",
+    ):
         self.model_size = model_size
         self.device = device
         self.language = language
@@ -290,7 +366,7 @@ class VoiceTyping:
         print(f"🖥️  Display server: {self.display_server.upper()}")
 
         # Check ydotool daemon for Wayland
-        if self.display_server == 'wayland':
+        if self.display_server == "wayland":
             if check_ydotool_daemon():
                 print(f"✅ ydotoold daemon running")
             else:
@@ -304,12 +380,10 @@ class VoiceTyping:
         self.command_executor = None
         if commands_enabled and COMMANDS_AVAILABLE:
             self.command_detector = CommandDetector(
-                custom_commands_path=commands_file,
-                enabled=True
+                custom_commands_path=commands_file, enabled=True
             )
             self.command_executor = CommandExecutor(
-                voice_typing=self,
-                allow_shell_commands=allow_shell_commands
+                voice_typing=self, allow_shell_commands=allow_shell_commands
             )
             print(f"🎯 Command detection enabled")
         elif commands_enabled and not COMMANDS_AVAILABLE:
@@ -323,7 +397,9 @@ class VoiceTyping:
 
         # Limits to avoid unbounded buffers under slow transcription
         self.max_recording_seconds = max_recording_seconds
-        self.max_recording_chunks = int(self.sample_rate / self.chunk_size * self.max_recording_seconds)
+        self.max_recording_chunks = int(
+            self.sample_rate / self.chunk_size * self.max_recording_seconds
+        )
         self.dropped_transcriptions = 0
         self.last_audio_status_log = 0.0
         self.last_vad_update = 0.0
@@ -348,8 +424,8 @@ class VoiceTyping:
         self.vad_aggressiveness = 2  # Level 2: better noise rejection
         self.vad_mode = self.vad_aggressiveness
         self.adaptive_vad = adaptive_vad
-        self.pre_buffer_size = 30    # 600ms at 20ms chunks
-        self.post_buffer_size = 40   # 800ms after silence
+        self.pre_buffer_size = 30  # 600ms at 20ms chunks
+        self.post_buffer_size = 40  # 800ms after silence
 
         # Noise handling
         self.calibration_seconds = calibration_seconds
@@ -394,11 +470,26 @@ class VoiceTyping:
         self.viz_position = viz_position
         self.viz_hide_delay = viz_hide_delay
 
+        # Streaming STT (sherpa-onnx streaming + optional faster-whisper refinement)
+        self.streaming_enabled = streaming_enabled and STREAMING_AVAILABLE
+        self.streaming_model = streaming_model
+        self.refinement_enabled = refinement_enabled and streaming_enabled
+        self.refinement_model = refinement_model
+        self.streaming_stt = None
+        self.streaming_thread = None
+        self.streaming_queue = queue.Queue(maxsize=200)  # ~4s of 20ms chunks
+        self.current_streaming_text = ""
+        self.streaming_lock = threading.Lock()
+
+        if streaming_enabled and not STREAMING_AVAILABLE:
+            print("streaming requested but sherpa-onnx not installed")
+            print("   Install with: pip install sherpa-onnx")
+
         # Model performance suggestions
-        if device == 'cuda':
-            if model_size in ['large', 'large-v3']:
+        if device == "cuda":
+            if model_size in ["large", "large-v3"]:
                 print(f"💡 Performance tip: Consider 'distil-large-v3' for 1.5x speed")
-            elif model_size == 'small':
+            elif model_size == "small":
                 print(f"💡 Performance tip: For better accuracy, try 'distil-medium'")
 
         print(f"Initializing Voice Typing (model: {model_size}, device: {device})")
@@ -416,13 +507,15 @@ class VoiceTyping:
                 print(f"⚠️  Input device not found: {self.input_device} (using default)")
             elif self.input_device_index is not None:
                 info = self.audio.get_device_info_by_index(self.input_device_index)
-                print(f"🎙️  Using input device [{self.input_device_index}]: {info.get('name', 'unknown')}")
+                print(
+                    f"🎙️  Using input device [{self.input_device_index}]: {info.get('name', 'unknown')}"
+                )
 
             # Calibrate ambient noise floor before VAD starts
             self._calibrate_noise_floor()
 
             # Advanced GPU optimizations
-            if self.device == 'cuda' and TORCH_AVAILABLE:
+            if self.device == "cuda" and TORCH_AVAILABLE:
                 try:
                     torch.backends.cuda.matmul.allow_tf32 = True
                     torch.backends.cudnn.allow_tf32 = True
@@ -433,10 +526,16 @@ class VoiceTyping:
                         torch.cuda.empty_cache()
 
                         try:
-                            self.pinned_buffer = torch.cuda.FloatTensor(16000 * 10).pin_memory()
-                            print(f"🚀 GPU optimizations enabled: Tensor Cores + Pinned Buffers")
+                            self.pinned_buffer = torch.cuda.FloatTensor(
+                                16000 * 10
+                            ).pin_memory()
+                            print(
+                                f"🚀 GPU optimizations enabled: Tensor Cores + Pinned Buffers"
+                            )
                         except:
-                            print(f"🚀 GPU optimizations enabled: Tensor Cores + Memory")
+                            print(
+                                f"🚀 GPU optimizations enabled: Tensor Cores + Memory"
+                            )
                 except Exception as e:
                     print(f"⚠️  GPU optimizations partially failed: {e}")
 
@@ -444,20 +543,42 @@ class VoiceTyping:
             self.vad = webrtcvad.Vad(self.vad_aggressiveness)
             self.vad_mode = self.vad_aggressiveness
 
-            # Initialize Whisper model
-            print(f"Loading Whisper model '{self.model_size}' on {self.device}...")
-            self.model = WhisperModel(
-                self.model_size,
-                device=self.device,
-                compute_type="int8_float16" if self.device == "cuda" else "int8"
-            )
-            print("Model loaded successfully!")
+            # Initialize streaming STT if enabled
+            if self.streaming_enabled:
+                from streaming_stt import StreamingSTT
 
-            # Warm up the model
-            print("Warming up model...")
-            dummy_audio = np.zeros(16000, dtype=np.float32)
-            list(self.model.transcribe(dummy_audio, language=self.language or "en"))
-            print("Model warmed up!")
+                self.streaming_stt = StreamingSTT(
+                    model_name=self.streaming_model,
+                    sample_rate=self.sample_rate,
+                )
+                self.streaming_stt.create_recognizer()
+                # In streaming mode, reduce post-buffer since endpoint detection
+                # is handled by sherpa-onnx
+                self.post_buffer_size = 20  # 400ms instead of 800ms
+
+            # Initialize Whisper model (skip if streaming-only without refinement)
+            if not self.streaming_enabled or self.refinement_enabled:
+                whisper_model = (
+                    self.refinement_model
+                    if self.refinement_enabled
+                    else self.model_size
+                )
+                print(f"Loading Whisper model '{whisper_model}' on {self.device}...")
+                self.model = WhisperModel(
+                    whisper_model,
+                    device=self.device,
+                    compute_type="int8_float16" if self.device == "cuda" else "int8",
+                )
+                print("Model loaded successfully!")
+
+                # Warm up the model
+                print("Warming up model...")
+                dummy_audio = np.zeros(16000, dtype=np.float32)
+                list(self.model.transcribe(dummy_audio, language=self.language or "en"))
+                print("Model warmed up!")
+            else:
+                print("Streaming-only mode (no Whisper refinement)")
+                self.model = None
 
             # Initialize audio stream
             self.stream = self.audio.open(
@@ -467,7 +588,7 @@ class VoiceTyping:
                 input=True,
                 input_device_index=self.input_device_index,
                 frames_per_buffer=self.chunk_size,
-                stream_callback=self.audio_callback
+                stream_callback=self.audio_callback,
             )
 
             print(f"Audio stream initialized (sample rate: {self.sample_rate} Hz)")
@@ -506,8 +627,10 @@ class VoiceTyping:
         # Try pynput first (works on X11 and XWayland)
         if PYNPUT_AVAILABLE:
             try:
-                hotkey_str = HOTKEY_MAP.get(self.hotkey, f'<{self.hotkey}>')
-                self.hotkey_listener = keyboard.GlobalHotKeys({hotkey_str: self._toggle_pause})
+                hotkey_str = HOTKEY_MAP.get(self.hotkey, f"<{self.hotkey}>")
+                self.hotkey_listener = keyboard.GlobalHotKeys(
+                    {hotkey_str: self._toggle_pause}
+                )
                 self.hotkey_listener.start()
 
                 # Test if it actually works (may fail silently on Wayland)
@@ -559,9 +682,7 @@ class VoiceTyping:
             self._write_socket_token()
 
             self.socket_thread = threading.Thread(
-                target=self._socket_listener,
-                daemon=True,
-                name="SocketListener"
+                target=self._socket_listener, daemon=True, name="SocketListener"
             )
             self.socket_thread.start()
         except Exception as e:
@@ -571,7 +692,7 @@ class VoiceTyping:
         """Create a per-session token to guard the socket."""
         try:
             self.socket_token = secrets.token_hex(16)
-            with open(TOKEN_PATH, 'w') as f:
+            with open(TOKEN_PATH, "w") as f:
                 f.write(self.socket_token)
             os.chmod(TOKEN_PATH, 0o600)
         except Exception as e:
@@ -583,7 +704,7 @@ class VoiceTyping:
         while self.running:
             try:
                 conn, _ = self.socket_server.accept()
-                data = conn.recv(128).decode(errors='ignore').strip()
+                data = conn.recv(128).decode(errors="ignore").strip()
                 conn.close()
 
                 parts = data.split()
@@ -595,22 +716,24 @@ class VoiceTyping:
                 if self.socket_token and token != self.socket_token:
                     self.bad_socket_tokens += 1
                     if self.bad_socket_tokens == 1:
-                        print("⚠️  Invalid socket token received (further warnings suppressed)")
+                        print(
+                            "⚠️  Invalid socket token received (further warnings suppressed)"
+                        )
                     continue
 
-                if cmd in ('toggle', 'pause', 'resume'):
-                    if cmd == 'toggle':
+                if cmd in ("toggle", "pause", "resume"):
+                    if cmd == "toggle":
                         self._toggle_pause()
-                    elif cmd == 'pause' and not self.is_paused:
+                    elif cmd == "pause" and not self.is_paused:
                         self._toggle_pause()
-                    elif cmd == 'resume' and self.is_paused:
+                    elif cmd == "resume" and self.is_paused:
                         self._toggle_pause()
-                elif cmd in ('ptt_down', 'ptt_up', 'ptt_toggle'):
+                elif cmd in ("ptt_down", "ptt_up", "ptt_toggle"):
                     if not self.ptt_enabled:
                         continue
-                    if cmd == 'ptt_down':
+                    if cmd == "ptt_down":
                         self._set_ptt(True)
-                    elif cmd == 'ptt_up':
+                    elif cmd == "ptt_up":
                         self._set_ptt(False)
                     else:
                         self._set_ptt(not self.ptt_active)
@@ -623,15 +746,15 @@ class VoiceTyping:
 
     def _print_wayland_instructions(self):
         """Print instructions for Wayland hotkey setup"""
-        print("\n" + "="*50)
+        print("\n" + "=" * 50)
         print("📋 WAYLAND HOTKEY SETUP")
-        print("="*50)
+        print("=" * 50)
         print(f"Run this to toggle pause with {self.hotkey.upper()}:")
         print(f"  ./voice-toggle")
         print("")
         print("Or add to your compositor's keybindings:")
         if os.path.exists(TOKEN_PATH):
-            print(f"  Command: echo \"toggle $(cat {TOKEN_PATH})\" | nc -U {SOCKET_PATH}")
+            print(f'  Command: echo "toggle $(cat {TOKEN_PATH})" | nc -U {SOCKET_PATH}')
         else:
             print(f"  Command: echo toggle | nc -U {SOCKET_PATH}")
         print("")
@@ -644,12 +767,12 @@ class VoiceTyping:
         if self.ptt_enabled:
             if os.path.exists(TOKEN_PATH):
                 print("PTT commands via socket:")
-                print(f"  echo \"ptt_down $(cat {TOKEN_PATH})\" | nc -U {SOCKET_PATH}")
-                print(f"  echo \"ptt_up $(cat {TOKEN_PATH})\" | nc -U {SOCKET_PATH}")
+                print(f'  echo "ptt_down $(cat {TOKEN_PATH})" | nc -U {SOCKET_PATH}')
+                print(f'  echo "ptt_up $(cat {TOKEN_PATH})" | nc -U {SOCKET_PATH}')
             else:
                 print(f"  echo ptt_down | nc -U {SOCKET_PATH}")
                 print(f"  echo ptt_up | nc -U {SOCKET_PATH}")
-        print("="*50 + "\n")
+        print("=" * 50 + "\n")
 
     def _log(self, message: str, level: str = "info"):
         """Log to file if configured."""
@@ -667,14 +790,15 @@ class VoiceTyping:
             qsize = 0
         status = "paused" if self.is_paused else "active"
         ptt = "ptt:on" if self.ptt_active else "ptt:off"
-        return f"status={status} queue={qsize} dropped={self.dropped_transcriptions} vad={self.vad_mode} {ptt}"
+        streaming = "streaming:on" if self.streaming_enabled else "streaming:off"
+        return f"status={status} queue={qsize} dropped={self.dropped_transcriptions} vad={self.vad_mode} {ptt} {streaming}"
 
     def _notify(self, title: str, body: str | None = None):
         """Send desktop notification if enabled."""
         if not self.notify_enabled:
             return
         try:
-            args = ['notify-send', title]
+            args = ["notify-send", title]
             if body:
                 args.append(body)
             subprocess.run(args, check=False)
@@ -685,20 +809,20 @@ class VoiceTyping:
         """Parse a key name into pynput key or char."""
         key_str = key_str.lower().strip()
         special_map = {
-            'f1': keyboard.Key.f1,
-            'f2': keyboard.Key.f2,
-            'f3': keyboard.Key.f3,
-            'f4': keyboard.Key.f4,
-            'f5': keyboard.Key.f5,
-            'f6': keyboard.Key.f6,
-            'f7': keyboard.Key.f7,
-            'f8': keyboard.Key.f8,
-            'f9': keyboard.Key.f9,
-            'f10': keyboard.Key.f10,
-            'f11': keyboard.Key.f11,
-            'f12': keyboard.Key.f12,
-            'pause': keyboard.Key.pause,
-            'scroll_lock': keyboard.Key.scroll_lock,
+            "f1": keyboard.Key.f1,
+            "f2": keyboard.Key.f2,
+            "f3": keyboard.Key.f3,
+            "f4": keyboard.Key.f4,
+            "f5": keyboard.Key.f5,
+            "f6": keyboard.Key.f6,
+            "f7": keyboard.Key.f7,
+            "f8": keyboard.Key.f8,
+            "f9": keyboard.Key.f9,
+            "f10": keyboard.Key.f10,
+            "f11": keyboard.Key.f11,
+            "f12": keyboard.Key.f12,
+            "pause": keyboard.Key.pause,
+            "scroll_lock": keyboard.Key.scroll_lock,
         }
         if key_str in special_map:
             return special_map[key_str]
@@ -722,15 +846,15 @@ class VoiceTyping:
             raise ValueError(f"Unknown PTT hotkey: {self.ptt_hotkey}")
 
         def on_press(k):
-            if k == key or (hasattr(k, 'char') and k.char == key):
-                if self.ptt_mode == 'toggle':
+            if k == key or (hasattr(k, "char") and k.char == key):
+                if self.ptt_mode == "toggle":
                     self._set_ptt(not self.ptt_active)
                 else:
                     self._set_ptt(True)
 
         def on_release(k):
-            if self.ptt_mode == 'hold':
-                if k == key or (hasattr(k, 'char') and k.char == key):
+            if self.ptt_mode == "hold":
+                if k == key or (hasattr(k, "char") and k.char == key):
                     self._set_ptt(False)
 
         self.ptt_listener = keyboard.Listener(on_press=on_press, on_release=on_release)
@@ -757,7 +881,10 @@ class VoiceTyping:
         needle = str(self.input_device).lower()
         for idx in range(device_count):
             info = self.audio.get_device_info_by_index(idx)
-            if info.get('maxInputChannels', 0) > 0 and needle in info.get('name', '').lower():
+            if (
+                info.get("maxInputChannels", 0) > 0
+                and needle in info.get("name", "").lower()
+            ):
                 return idx
 
         return None
@@ -771,9 +898,9 @@ class VoiceTyping:
             print("Input devices:")
             for idx in range(device_count):
                 info = audio.get_device_info_by_index(idx)
-                if info.get('maxInputChannels', 0) > 0:
-                    name = info.get('name', 'unknown')
-                    default_tag = " (default)" if info.get('defaultSampleRate') else ""
+                if info.get("maxInputChannels", 0) > 0:
+                    name = info.get("name", "unknown")
+                    default_tag = " (default)" if info.get("defaultSampleRate") else ""
                     print(f"  [{idx}] {name}{default_tag}")
         finally:
             audio.terminate()
@@ -785,7 +912,9 @@ class VoiceTyping:
         float_chunk = audio_chunk.astype(np.float32, copy=False)
         return float(np.sqrt(np.mean(float_chunk * float_chunk)))
 
-    def _apply_agc(self, audio_chunk: np.ndarray, rms: float) -> tuple[np.ndarray, float]:
+    def _apply_agc(
+        self, audio_chunk: np.ndarray, rms: float
+    ) -> tuple[np.ndarray, float]:
         """Apply automatic gain control to reach target RMS."""
         if rms <= 0.0:
             return audio_chunk, rms
@@ -905,6 +1034,13 @@ class VoiceTyping:
         else:
             is_speech = self.vad.is_speech(in_data, self.sample_rate)
 
+        # Push to streaming STT queue (non-blocking, every chunk)
+        if self.streaming_enabled:
+            try:
+                self.streaming_queue.put_nowait(raw_chunk.copy())
+            except queue.Full:
+                pass  # Drop if queue full - streaming is best-effort
+
         # Push to audio visualizer (non-blocking)
         if self.visualizer:
             self.visualizer.push_audio(raw_chunk)
@@ -918,49 +1054,57 @@ class VoiceTyping:
         if self.agc_enabled:
             audio_chunk, _ = self._apply_agc(raw_chunk, raw_rms)
 
-        with self.buffer_lock:
-            if is_speech:
-                if not self.is_recording:
-                    self.recording_buffer = list(self.pre_buffer)
-                    self.is_recording = True
+        # In streaming mode, the streaming_worker handles audio accumulation,
+        # endpoint detection, and queuing for refinement. Skip the batch VAD path.
+        if not self.streaming_enabled:
+            with self.buffer_lock:
+                if is_speech:
+                    if not self.is_recording:
+                        self.recording_buffer = list(self.pre_buffer)
+                        self.is_recording = True
 
-                self.recording_buffer.append(audio_chunk.copy())
-                self.silence_chunks = 0
-                if len(self.recording_buffer) >= self.max_recording_chunks:
-                    audio_to_process = self.recording_buffer.copy()
-                    self._enqueue_transcription(audio_to_process)
-
-                    self.is_recording = False
+                    self.recording_buffer.append(audio_chunk.copy())
                     self.silence_chunks = 0
-                    self.recording_buffer = []
+                    if len(self.recording_buffer) >= self.max_recording_chunks:
+                        audio_to_process = self.recording_buffer.copy()
+                        self._enqueue_transcription(audio_to_process)
 
-            elif self.is_recording:
-                self.recording_buffer.append(audio_chunk.copy())
-                self.silence_chunks += 1
+                        self.is_recording = False
+                        self.silence_chunks = 0
+                        self.recording_buffer = []
 
-                if len(self.recording_buffer) >= self.max_recording_chunks:
-                    audio_to_process = self.recording_buffer.copy()
-                    self._enqueue_transcription(audio_to_process)
+                elif self.is_recording:
+                    self.recording_buffer.append(audio_chunk.copy())
+                    self.silence_chunks += 1
 
-                    self.is_recording = False
-                    self.silence_chunks = 0
-                    self.recording_buffer = []
-                elif self.silence_chunks >= self.post_buffer_size:
-                    audio_to_process = self.recording_buffer.copy()
-                    self._enqueue_transcription(audio_to_process)
+                    if len(self.recording_buffer) >= self.max_recording_chunks:
+                        audio_to_process = self.recording_buffer.copy()
+                        self._enqueue_transcription(audio_to_process)
 
-                    self.is_recording = False
-                    self.silence_chunks = 0
-                    self.recording_buffer = []
+                        self.is_recording = False
+                        self.silence_chunks = 0
+                        self.recording_buffer = []
+                    elif self.silence_chunks >= self.post_buffer_size:
+                        audio_to_process = self.recording_buffer.copy()
+                        self._enqueue_transcription(audio_to_process)
 
-            self.pre_buffer.append(audio_chunk.copy())
+                        self.is_recording = False
+                        self.silence_chunks = 0
+                        self.recording_buffer = []
+
+                self.pre_buffer.append(audio_chunk.copy())
 
         return (None, pyaudio.paContinue)
 
-    def _enqueue_transcription(self, audio_to_process):
+    def _enqueue_transcription(self, audio_to_process, streaming_text=None):
         """Queue audio for transcription without blocking the audio callback."""
+        item = (
+            (audio_to_process, streaming_text)
+            if self.streaming_enabled
+            else audio_to_process
+        )
         try:
-            self.transcription_queue.put_nowait(audio_to_process)
+            self.transcription_queue.put_nowait(item)
         except queue.Full:
             # Drop oldest to keep latency bounded
             self.dropped_transcriptions += 1
@@ -970,16 +1114,21 @@ class VoiceTyping:
             except queue.Empty:
                 pass
             try:
-                self.transcription_queue.put_nowait(audio_to_process)
+                self.transcription_queue.put_nowait(item)
             except queue.Full:
                 self.dropped_transcriptions += 1
 
     def transcription_worker(self):
-        """Background thread for Whisper transcription"""
+        """Background thread for Whisper transcription (also serves as refinement in streaming mode)"""
         while self.running:
             try:
-                audio_buffer = self.transcription_queue.get(timeout=0.1)
-                self._process_audio(audio_buffer)
+                queue_item = self.transcription_queue.get(timeout=0.1)
+                if self.streaming_enabled and isinstance(queue_item, tuple):
+                    audio_buffer, streaming_text = queue_item
+                    self._process_audio(audio_buffer, streaming_text=streaming_text)
+                else:
+                    audio_buffer = queue_item
+                    self._process_audio(audio_buffer)
                 if self.dropped_transcriptions:
                     dropped = self.dropped_transcriptions
                     self.dropped_transcriptions = 0
@@ -990,8 +1139,12 @@ class VoiceTyping:
             except Exception as e:
                 print(f"❌ Transcription worker error: {e}")
 
-    def _process_audio(self, recording_buffer):
-        """Process recorded audio with Whisper"""
+    def _process_audio(self, recording_buffer, streaming_text=None):
+        """Process recorded audio with Whisper.
+
+        In streaming mode (streaming_text is not None), this acts as the refinement
+        pass: compare turbo result with streaming output and correct if different.
+        """
         if not recording_buffer:
             return
 
@@ -999,25 +1152,53 @@ class VoiceTyping:
             audio_data = np.concatenate(recording_buffer)
             audio_float = audio_data.astype(np.float32, copy=False) / 32768.0
 
-            print("⚡ Transcribing...")
+            is_refinement = self.streaming_enabled and streaming_text is not None
+
+            if is_refinement:
+                print("🔄 Refining...")
+            else:
+                print("⚡ Transcribing...")
             start_time = time.time()
 
-            prompt = self.previous_text[-200:] if self.previous_text else "Clear speech dictation."
-
-            segments, info = self.model.transcribe(
-                audio_float,
-                language=self.language or "en",
-                initial_prompt=prompt,
-                temperature=0.0,
-                beam_size=5,
-                condition_on_previous_text=True,
-                without_timestamps=True,
-                vad_filter=True,
-                vad_parameters=dict(
-                    min_silence_duration_ms=1000,
-                    speech_pad_ms=400,
-                ),
+            prompt = (
+                self.previous_text[-200:]
+                if self.previous_text
+                else "Clear speech dictation."
             )
+
+            if is_refinement:
+                # Refinement pass: fast turbo with beam_size=1
+                # VAD filter ON because streaming audio buffer includes silence
+                segments, info = self.model.transcribe(
+                    audio_float,
+                    language=self.language or "en",
+                    initial_prompt=prompt,
+                    temperature=0.0,
+                    beam_size=1,
+                    condition_on_previous_text=True,
+                    without_timestamps=True,
+                    vad_filter=True,
+                    vad_parameters=dict(
+                        min_silence_duration_ms=500,
+                        speech_pad_ms=200,
+                    ),
+                )
+            else:
+                # Batch mode: full accuracy settings
+                segments, info = self.model.transcribe(
+                    audio_float,
+                    language=self.language or "en",
+                    initial_prompt=prompt,
+                    temperature=0.0,
+                    beam_size=5,
+                    condition_on_previous_text=True,
+                    without_timestamps=True,
+                    vad_filter=True,
+                    vad_parameters=dict(
+                        min_silence_duration_ms=1000,
+                        speech_pad_ms=400,
+                    ),
+                )
 
             text = ""
             for segment in segments:
@@ -1026,7 +1207,83 @@ class VoiceTyping:
 
             if text:
                 transcribe_time = time.time() - start_time
-                print(f"✅ [{transcribe_time:.2f}s] '{text}'")
+
+                if is_refinement:
+                    # Compare refinement result with streaming output
+                    streaming_normalized = " ".join(streaming_text.lower().split())
+                    refined_normalized = " ".join(text.lower().split())
+
+                    if streaming_normalized == refined_normalized:
+                        print(f"✅ [{transcribe_time:.2f}s] Confirmed: '{text}'")
+                    else:
+                        # Sanity check: reject refinement if output is much shorter
+                        stream_word_count = len(streaming_normalized.split())
+                        refined_word_count = len(refined_normalized.split())
+                        too_short = (
+                            stream_word_count > 3
+                            and refined_word_count < stream_word_count * 0.4
+                        )
+
+                        # Check if user has moved on (new streaming text typed)
+                        with self.streaming_lock:
+                            new_streaming = self.current_streaming_text
+
+                        if too_short:
+                            print(
+                                f"⚠️  [{transcribe_time:.2f}s] Rejected refinement (too short {refined_word_count}/{stream_word_count} words): '{streaming_text}' -> '{text}'"
+                            )
+                            self._log(
+                                f"refinement_rejected streaming='{streaming_text}' refined='{text}' reason=too_short"
+                            )
+                        elif new_streaming:
+                            print(
+                                f"⏭️  [{transcribe_time:.2f}s] Skipped correction (user moved on): '{streaming_text}' -> '{text}'"
+                            )
+                            self._log(
+                                f"refinement_skipped streaming='{streaming_text}' refined='{text}' reason=user_moved_on"
+                            )
+                        else:
+                            # Use LCP diff to minimize backspacing
+                            s_lower = streaming_text.lower()
+                            t_lower = text.lower()
+                            common_len = 0
+                            for ci in range(min(len(s_lower), len(t_lower))):
+                                if s_lower[ci] == t_lower[ci]:
+                                    common_len = ci + 1
+                                else:
+                                    break
+                            chars_to_delete = len(streaming_text) - common_len
+                            new_suffix = text[common_len:]
+
+                            max_bs = 30
+                            if common_len == 0 and len(text) < len(streaming_text):
+                                print(
+                                    f"⚠️  [{transcribe_time:.2f}s] Rejected refinement (trimmed start): '{streaming_text}' -> '{text}'"
+                                )
+                                self._log(
+                                    f"refinement_rejected streaming='{streaming_text}' refined='{text}' reason=trimmed_start"
+                                )
+                            elif chars_to_delete > max_bs:
+                                print(
+                                    f"⚠️  [{transcribe_time:.2f}s] Skipped refinement (bs={chars_to_delete}>{max_bs}): '{streaming_text}' -> '{text}'"
+                                )
+                                self._log(
+                                    f"refinement_skipped streaming='{streaming_text}' refined='{text}' reason=bs_too_large bs={chars_to_delete}"
+                                )
+                            else:
+                                print(
+                                    f"🔄 [{transcribe_time:.2f}s] Refined (bs={chars_to_delete}): '{streaming_text}' -> '{text}'"
+                                )
+                                self._log(
+                                    f"refinement_correction streaming='{streaming_text}' refined='{text}' bs={chars_to_delete}"
+                                )
+                                if chars_to_delete > 0:
+                                    self._send_backspaces(chars_to_delete)
+                                if new_suffix:
+                                    self._type_raw(new_suffix)
+                else:
+                    print(f"✅ [{transcribe_time:.2f}s] '{text}'")
+
                 try:
                     qsize = self.transcription_queue.qsize()
                 except Exception:
@@ -1037,9 +1294,23 @@ class VoiceTyping:
 
                 self.previous_text = (self.previous_text + " " + text)[-500:]
 
+                # In refinement mode, text is already typed by streaming - skip unless corrected
+                if is_refinement:
+                    # Process punctuation on the final text for history
+                    if self.commands_enabled and COMMANDS_AVAILABLE:
+                        from commands import process_punctuation
+
+                        text = process_punctuation(text)
+                    # Update typing history with the final result
+                    self.typing_history.append((text, len(text)))
+                    if len(self.typing_history) > self.max_history:
+                        self.typing_history.pop(0)
+                    return
+
                 # Process punctuation commands if commands enabled
                 if self.commands_enabled and COMMANDS_AVAILABLE:
                     from commands import process_punctuation
+
                     text = process_punctuation(text)
 
                 # Check for voice commands if enabled
@@ -1051,23 +1322,31 @@ class VoiceTyping:
 
                     intent, confidence, params = self.command_detector.detect(text)
 
-                    if intent != 'dictation' and confidence >= self.command_min_confidence:
-                        action = params.get('action', intent)
+                    if (
+                        intent != "dictation"
+                        and confidence >= self.command_min_confidence
+                    ):
+                        action = params.get("action", intent)
                         print(f"🎯 Command: {action} ({confidence:.0%})")
 
                         # Handle force_dictation (e.g., "type hello world")
-                        if intent == 'force_dictation':
-                            forced_text = params.get('text', '')
+                        if intent == "force_dictation":
+                            forced_text = params.get("text", "")
                             if forced_text:
                                 self.type_text(forced_text)
                         else:
-                            if self.require_command_arm and time.time() > self.commands_armed_until:
+                            if (
+                                self.require_command_arm
+                                and time.time() > self.commands_armed_until
+                            ):
                                 print("⚠️  Command ignored (say 'command mode' to arm)")
                                 self.type_text(text)
                                 return
 
                             if confidence < self.command_confirm_below:
-                                self._set_pending_command(intent, params, confidence, text)
+                                self._set_pending_command(
+                                    intent, params, confidence, text
+                                )
                                 return
 
                             executed = self.command_executor.execute(intent, params)
@@ -1085,12 +1364,233 @@ class VoiceTyping:
             print(f"❌ Transcription error: {e}")
             self._log(f"transcription_error {e}", level="error")
             import traceback
+
             traceback.print_exc()
+
+    def streaming_worker(self):
+        """Background thread for streaming STT (Pass 1: real-time partial results).
+
+        Drains all available chunks in a batch, feeds them to sherpa-onnx,
+        then updates the display once. Throttles typing to ~150ms intervals
+        to prevent ydotool subprocess pileup.
+        When an endpoint is detected, queues the full audio for refinement.
+        """
+        # Accumulate chunks for refinement pass
+        streaming_audio_buffer = []
+        last_type_time = 0.0
+        type_interval = 0.15  # Minimum seconds between typing updates
+        pending_partial = ""  # Latest partial waiting to be typed
+        needs_leading_space = False  # Add space before next utterance
+        utterance_prefix = (
+            ""  # Space prefix for current utterance (persists across partials)
+        )
+
+        while self.running:
+            # Drain all available chunks in a batch
+            chunks = []
+            try:
+                chunk = self.streaming_queue.get(timeout=0.1)
+                chunks.append(chunk)
+            except queue.Empty:
+                # No new audio - but check if we have a pending partial to type
+                if pending_partial:
+                    self._type_streaming_partial(pending_partial)
+                    pending_partial = ""
+                    last_type_time = time.time()
+                continue
+
+            # Drain any additional queued chunks (non-blocking)
+            while True:
+                try:
+                    chunks.append(self.streaming_queue.get_nowait())
+                except queue.Empty:
+                    break
+
+            if not self.streaming_enabled or self.streaming_stt is None:
+                continue
+
+            # Feed all chunks to sherpa-onnx
+            endpoint_hit = False
+            endpoint_idx = -1
+            for idx, chunk in enumerate(chunks):
+                streaming_audio_buffer.append(chunk.copy())
+                partial = self.streaming_stt.feed_chunk(chunk)
+                if partial:
+                    # Set utterance prefix once at start of new utterance
+                    if needs_leading_space:
+                        utterance_prefix = " "
+                        needs_leading_space = False
+                    # Always apply prefix so LCP diff stays consistent
+                    pending_partial = utterance_prefix + partial
+
+                # Check for endpoint after each chunk
+                is_endpoint, final_text = self.streaming_stt.check_endpoint()
+                if is_endpoint:
+                    endpoint_hit = True
+                    endpoint_idx = idx
+                    if final_text:
+                        pending_partial = utterance_prefix + final_text
+                    break  # Stop processing more chunks after endpoint
+
+            # Type the pending partial if enough time has passed
+            now = time.time()
+            if pending_partial and (now - last_type_time >= type_interval):
+                self._type_streaming_partial(pending_partial)
+                pending_partial = ""
+                last_type_time = now
+
+            # Handle endpoint (end of utterance)
+            if endpoint_hit and streaming_audio_buffer:
+                # Flush any remaining pending partial
+                if pending_partial:
+                    self._type_streaming_partial(pending_partial)
+                    pending_partial = ""
+                    last_type_time = time.time()
+
+                with self.streaming_lock:
+                    streamed = self.current_streaming_text
+                    self.current_streaming_text = ""
+
+                if streamed:
+                    # Strip leading space before sending to refinement
+                    # (turbo won't produce a leading space, so comparison must be fair)
+                    refinement_text = streamed.lstrip()
+                    if self.refinement_enabled and refinement_text:
+                        audio_copy = streaming_audio_buffer.copy()
+                        self._enqueue_transcription(
+                            audio_copy, streaming_text=refinement_text
+                        )
+                    self._log(
+                        f"streaming_endpoint text='{streamed}' chunks={len(streaming_audio_buffer)}"
+                    )
+                    # Track for scratch-that
+                    self.typing_history.append((streamed, len(streamed)))
+                    if len(self.typing_history) > self.max_history:
+                        self.typing_history.pop(0)
+                    self.previous_text = (self.previous_text + " " + streamed)[-500:]
+                    needs_leading_space = True  # Next utterance gets a space prefix
+
+                # Reset prefix for next utterance
+                utterance_prefix = ""
+                streaming_audio_buffer = []
+
+                # Carry over unprocessed chunks from after the endpoint
+                if endpoint_idx >= 0 and endpoint_idx + 1 < len(chunks):
+                    remaining = chunks[endpoint_idx + 1 :]
+                    for leftover in remaining:
+                        streaming_audio_buffer.append(leftover.copy())
+                        self.streaming_stt.feed_chunk(leftover)
+
+            # Prevent unbounded buffer growth
+            max_streaming_chunks = int(
+                self.sample_rate / self.chunk_size * self.max_recording_seconds
+            )
+            if len(streaming_audio_buffer) >= max_streaming_chunks:
+                if pending_partial:
+                    self._type_streaming_partial(pending_partial)
+                    pending_partial = ""
+                    last_type_time = time.time()
+                with self.streaming_lock:
+                    streamed = self.current_streaming_text
+                    self.current_streaming_text = ""
+                if streamed:
+                    audio_copy = streaming_audio_buffer.copy()
+                    self._enqueue_transcription(audio_copy, streaming_text=streamed)
+                streaming_audio_buffer = []
+                self.streaming_stt.reset()
+
+    def _type_streaming_partial(self, new_partial: str):
+        """Incrementally type streaming partial results with backspace correction.
+
+        Lowercases sherpa-onnx output (which is ALL CAPS) for readability.
+        Finds the longest common prefix between what's currently on screen
+        and the new partial, backspaces the divergent tail, and types new text.
+        """
+        with self.streaming_lock:
+            # Lowercase sherpa-onnx output (refinement will fix casing later)
+            new_partial = new_partial.lower()
+
+            old_text = self.current_streaming_text
+
+            if not new_partial:
+                return
+
+            if new_partial == old_text:
+                return  # No change
+
+            # Find longest common prefix
+            common_len = 0
+            for i in range(min(len(old_text), len(new_partial))):
+                if old_text[i] == new_partial[i]:
+                    common_len = i + 1
+                else:
+                    break
+
+            # Backspace the divergent tail of old text
+            chars_to_delete = len(old_text) - common_len
+            # New characters to type
+            new_chars = new_partial[common_len:]
+
+            if chars_to_delete > 0:
+                self._send_backspaces(chars_to_delete)
+
+            if new_chars:
+                self._type_raw(new_chars)
+
+            self.current_streaming_text = new_partial
+
+    def _send_backspaces(self, count: int):
+        """Send backspace key presses."""
+        if count <= 0:
+            return
+        try:
+            if self.display_server == "wayland":
+                env = self._ydotool_env()
+                # ydotool key: 14 = BackSpace keycode
+                key_args = []
+                for _ in range(count):
+                    key_args.extend(["14:1", "14:0"])
+                subprocess.run(["ydotool", "key"] + key_args, check=True, env=env)
+            else:
+                subprocess.run(
+                    ["xdotool", "key", "--repeat", str(count), "BackSpace"],
+                    check=True,
+                )
+        except subprocess.CalledProcessError as e:
+            print(f"Backspace error: {e}")
+
+    def _type_raw(self, text: str):
+        """Type text without adding to typing history (for streaming partials)."""
+        if not text:
+            return
+        try:
+            if self.display_server == "wayland":
+                subprocess.run(
+                    ["ydotool", "type", "-d", "0", "-H", "0", "--", text],
+                    check=True,
+                    env=self._ydotool_env(),
+                )
+            else:
+                subprocess.run(["xdotool", "type", "--delay", "0", text], check=True)
+        except subprocess.CalledProcessError as e:
+            print(f"Type error: {e}")
+
+    def _replace_typed_text(self, old_text: str, new_text: str):
+        """Replace previously typed text with new text (for refinement corrections)."""
+        if not old_text:
+            self._type_raw(new_text)
+            return
+
+        # Backspace the old text
+        self._send_backspaces(len(old_text))
+        # Type the new text
+        if new_text:
+            self._type_raw(new_text)
 
     def _ydotool_env(self):
         """Get environment with ydotool socket path set"""
         env = os.environ.copy()
-        env['YDOTOOL_SOCKET'] = '/run/ydotoold/socket'
+        env["YDOTOOL_SOCKET"] = "/run/ydotoold/socket"
         return env
 
     def _handle_command_mode(self, text: str) -> bool:
@@ -1098,7 +1598,7 @@ class VoiceTyping:
         if not self.require_command_arm:
             return False
 
-        text_clean = text.lower().strip().strip('.')
+        text_clean = text.lower().strip().strip(".")
         if text_clean in ("command mode", "commands mode", "arm commands"):
             self.commands_armed_until = time.time() + self.command_arm_seconds
             print(f"🛡️  Command mode enabled for {self.command_arm_seconds}s")
@@ -1126,15 +1626,15 @@ class VoiceTyping:
             print("⚠️  Pending command expired (command mode off)")
             return True
 
-        text_clean = text.lower().strip().strip('.')
+        text_clean = text.lower().strip().strip(".")
         if text_clean in ("confirm", "yes", "do it"):
             pending = self.pending_command
             self.pending_command = None
 
             intent = pending["intent"]
             params = pending["params"]
-            if intent == 'force_dictation':
-                forced_text = params.get('text', '')
+            if intent == "force_dictation":
+                forced_text = params.get("text", "")
                 if forced_text:
                     self.type_text(forced_text)
                 return True
@@ -1153,7 +1653,9 @@ class VoiceTyping:
         self.pending_command = None
         return False
 
-    def _set_pending_command(self, intent: str, params: dict, confidence: float, text: str):
+    def _set_pending_command(
+        self, intent: str, params: dict, confidence: float, text: str
+    ):
         """Set a pending command for confirmation."""
         self.pending_command = {
             "intent": intent,
@@ -1162,18 +1664,22 @@ class VoiceTyping:
             "text": text,
             "created": time.time(),
         }
-        action = params.get('action', intent)
+        action = params.get("action", intent)
         print(f"🤔 Confirm command '{action}'? Say 'confirm' or 'cancel'.")
 
     def type_text(self, text):
         """Type text using xdotool (X11) or ydotool (Wayland)"""
         try:
-            if self.display_server == 'wayland':
+            if self.display_server == "wayland":
                 # ydotool for Wayland (--key-delay=0 --key-hold=0 for instant typing)
-                subprocess.run(['ydotool', 'type', '-d', '0', '-H', '0', '--', text], check=True, env=self._ydotool_env())
+                subprocess.run(
+                    ["ydotool", "type", "-d", "0", "-H", "0", "--", text],
+                    check=True,
+                    env=self._ydotool_env(),
+                )
             else:
                 # xdotool for X11
-                subprocess.run(['xdotool', 'type', '--delay', '0', text], check=True)
+                subprocess.run(["xdotool", "type", "--delay", "0", text], check=True)
             print(f"⌨️  Typed: '{text}'")
 
             # Track for scratch that
@@ -1184,7 +1690,7 @@ class VoiceTyping:
         except subprocess.CalledProcessError as e:
             print(f"❌ Failed to type: {e}")
         except FileNotFoundError:
-            tool = 'ydotool' if self.display_server == 'wayland' else 'xdotool'
+            tool = "ydotool" if self.display_server == "wayland" else "xdotool"
             print(f"❌ {tool} not found")
 
     def _scratch_that(self):
@@ -1192,15 +1698,18 @@ class VoiceTyping:
         if self.typing_history:
             last_text, char_count = self.typing_history.pop()
             try:
-                if self.display_server == 'wayland':
+                if self.display_server == "wayland":
                     # ydotool key syntax: repeat backspace
                     env = self._ydotool_env()
                     for _ in range(char_count):
-                        subprocess.run(['ydotool', 'key', '14:1', '14:0'], check=True, env=env)  # 14 = BackSpace keycode
+                        subprocess.run(
+                            ["ydotool", "key", "14:1", "14:0"], check=True, env=env
+                        )  # 14 = BackSpace keycode
                 else:
-                    subprocess.run([
-                        'xdotool', 'key', '--repeat', str(char_count), 'BackSpace'
-                    ], check=True)
+                    subprocess.run(
+                        ["xdotool", "key", "--repeat", str(char_count), "BackSpace"],
+                        check=True,
+                    )
                 print(f"🔙 Scratched: '{last_text}'")
                 return True
             except subprocess.CalledProcessError as e:
@@ -1213,12 +1722,12 @@ class VoiceTyping:
     def run(self):
         """Start voice typing"""
         try:
-            print("\n" + "="*50)
+            print("\n" + "=" * 50)
             print("🎙️  VOICE TYPING ACTIVE")
-            print("="*50)
+            print("=" * 50)
 
             # Display hotkey instructions based on display server
-            if self.display_server == 'wayland':
+            if self.display_server == "wayland":
                 print(f"⚠️  WAYLAND: Hotkey requires compositor binding")
                 print(f"   Bind {self.hotkey.upper()} to: ./voice-toggle")
                 print(f"   Or: echo toggle | nc -U {SOCKET_PATH}")
@@ -1226,7 +1735,7 @@ class VoiceTyping:
                 print(f"Hotkey: {self.hotkey.upper()} to pause/resume")
 
             print("Press Ctrl+C to stop")
-            print("="*50 + "\n")
+            print("=" * 50 + "\n")
 
             self.running = True
 
@@ -1237,9 +1746,24 @@ class VoiceTyping:
             self.transcription_thread = threading.Thread(
                 target=self.transcription_worker,
                 daemon=True,
-                name="TranscriptionWorker"
+                name="TranscriptionWorker",
             )
             self.transcription_thread.start()
+
+            # Start streaming thread if enabled
+            if self.streaming_enabled:
+                self.streaming_thread = threading.Thread(
+                    target=self.streaming_worker,
+                    daemon=True,
+                    name="StreamingWorker",
+                )
+                self.streaming_thread.start()
+                mode = (
+                    "streaming + refinement"
+                    if self.refinement_enabled
+                    else "streaming-only"
+                )
+                print(f"🔊 Streaming STT active ({mode})")
 
             # Start audio stream
             self.stream.start_stream()
@@ -1255,7 +1779,10 @@ class VoiceTyping:
                             self._restart_audio_stream()
                         except Exception as e:
                             print(f"⚠️  Audio stream restart failed: {e}")
-                if self.status_interval and time.time() - self.last_status_log >= self.status_interval:
+                if (
+                    self.status_interval
+                    and time.time() - self.last_status_log >= self.status_interval
+                ):
                     self.last_status_log = time.time()
                     status_line = self._status_snapshot()
                     print(f"ℹ️  {status_line}")
@@ -1306,6 +1833,8 @@ class VoiceTyping:
                 pass
 
         # Wait for threads
+        if self.streaming_thread and self.streaming_thread.is_alive():
+            self.streaming_thread.join(timeout=2.0)
         if self.transcription_thread and self.transcription_thread.is_alive():
             self.transcription_thread.join(timeout=2.0)
 
@@ -1340,7 +1869,7 @@ class VoiceTyping:
             input=True,
             input_device_index=self.input_device_index,
             frames_per_buffer=self.chunk_size,
-            stream_callback=self.audio_callback
+            stream_callback=self.audio_callback,
         )
         self.stream.start_stream()
 
@@ -1355,103 +1884,261 @@ def _build_defaults(config: dict) -> dict:
 
 
 def _build_parser(defaults: dict) -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description='Enhanced Voice Typing')
-    parser.add_argument('--config', default=defaults["config"],
-                       help='Config file (yaml/json)')
-    parser.add_argument('--list-devices', action='store_true',
-                       default=False, help='List input devices and exit')
-    parser.add_argument('--model', default=defaults["model"],
-                       choices=['tiny', 'base', 'small', 'medium', 'large',
-                               'distil-large-v3', 'distil-medium', 'large-v3'],
-                       help='Whisper model size')
-    parser.add_argument('--device', default=defaults["device"],
-                       choices=['auto', 'cpu', 'cuda'],
-                       help='Device to run on')
-    parser.add_argument('--language', default=defaults["language"],
-                       help='Language code (e.g., en, es, fr)')
-    parser.add_argument('--hotkey', default=defaults["hotkey"],
-                       choices=['f12', 'f11', 'f10', 'scroll_lock', 'pause'],
-                       help='Hotkey for pause/resume (default: f12)')
-    parser.add_argument('--commands', action=argparse.BooleanOptionalAction,
-                       default=defaults["commands"],
-                       help='Enable voice command detection (window/edit/custom)')
-    parser.add_argument('--commands-file', default=defaults["commands_file"],
-                       help='Custom commands YAML file')
-    parser.add_argument('--command-arm', action=argparse.BooleanOptionalAction,
-                       default=defaults["command_arm"],
-                       help='Require "command mode" to execute commands')
-    parser.add_argument('--command-arm-seconds', type=int, default=defaults["command_arm_seconds"],
-                       help='How long command mode stays armed (seconds)')
-    parser.add_argument('--command-min-confidence', type=float, default=defaults["command_min_confidence"],
-                       help='Minimum confidence to treat as a command')
-    parser.add_argument('--command-confirm-below', type=float, default=defaults["command_confirm_below"],
-                       help='Ask for confirmation below this confidence')
-    parser.add_argument('--command-confirm-seconds', type=float, default=defaults["command_confirm_seconds"],
-                       help='Time window to confirm a command')
-    parser.add_argument('--allow-shell', action=argparse.BooleanOptionalAction,
-                       default=defaults["allow_shell"],
-                       help='Allow custom shell commands from commands.yaml')
-    parser.add_argument('--max-seconds', type=int, default=defaults["max_seconds"],
-                       help='Max seconds per recording before forced flush')
-    parser.add_argument('--queue-size', type=int, default=defaults["queue_size"],
-                       help='Max queued recordings before dropping')
-    parser.add_argument('--calibrate-seconds', type=float, default=defaults["calibrate_seconds"],
-                       help='Seconds to sample ambient noise on startup')
-    parser.add_argument('--noise-gate', action=argparse.BooleanOptionalAction,
-                       default=defaults["noise_gate"],
-                       help='Enable noise gate based on ambient noise')
-    parser.add_argument('--noise-gate-multiplier', type=float, default=defaults["noise_gate_multiplier"],
-                       help='Noise gate threshold multiplier over noise floor')
-    parser.add_argument('--agc', action=argparse.BooleanOptionalAction,
-                       default=defaults["agc"],
-                       help='Enable automatic gain control')
-    parser.add_argument('--agc-target-rms', type=float, default=defaults["agc_target_rms"],
-                       help='AGC target RMS amplitude')
-    parser.add_argument('--agc-min-gain', type=float, default=defaults["agc_min_gain"],
-                       help='AGC minimum gain')
-    parser.add_argument('--agc-max-gain', type=float, default=defaults["agc_max_gain"],
-                       help='AGC maximum gain')
-    parser.add_argument('--adaptive-vad', action=argparse.BooleanOptionalAction,
-                       default=defaults["adaptive_vad"],
-                       help='Enable adaptive VAD aggressiveness')
-    parser.add_argument('--notify', action=argparse.BooleanOptionalAction,
-                       default=defaults["notify"],
-                       help='Enable desktop notifications (notify-send)')
-    parser.add_argument('--status-interval', type=float, default=defaults["status_interval"],
-                       help='Seconds between status lines (0 to disable)')
-    parser.add_argument('--input-device', default=defaults["input_device"],
-                       help='Input device index or name substring')
-    parser.add_argument('--ptt', action=argparse.BooleanOptionalAction,
-                       default=defaults["ptt"],
-                       help='Enable push-to-talk')
-    parser.add_argument('--ptt-hotkey', default=defaults["ptt_hotkey"],
-                       help='Push-to-talk hotkey (default: f9)')
-    parser.add_argument('--ptt-mode', default=defaults["ptt_mode"],
-                       choices=['hold', 'toggle'],
-                       help='Push-to-talk mode')
-    parser.add_argument('--log-file', default=defaults["log_file"],
-                       help='Log file path (empty to disable)')
-    parser.add_argument('--log-max-bytes', type=int, default=defaults["log_max_bytes"],
-                       help='Max log size before rotation')
-    parser.add_argument('--log-backups', type=int, default=defaults["log_backups"],
-                       help='Number of rotated logs to keep')
-    parser.add_argument('--log-level', default=defaults["log_level"],
-                       help='Log level (INFO, DEBUG, ERROR)')
-    parser.add_argument('--viz', action=argparse.BooleanOptionalAction,
-                       default=defaults["viz"],
-                       help='Enable audio visualization popup')
-    parser.add_argument('--viz-position', default=defaults["viz_position"],
-                       choices=['top-left', 'top-right', 'bottom-left', 'bottom-right'],
-                       help='Visualization popup position')
-    parser.add_argument('--viz-hide-delay', type=int, default=defaults["viz_hide_delay"],
-                       help='Milliseconds to wait before hiding after silence')
+    parser = argparse.ArgumentParser(description="Enhanced Voice Typing")
+    parser.add_argument(
+        "--config", default=defaults["config"], help="Config file (yaml/json)"
+    )
+    parser.add_argument(
+        "--list-devices",
+        action="store_true",
+        default=False,
+        help="List input devices and exit",
+    )
+    parser.add_argument(
+        "--model",
+        default=defaults["model"],
+        choices=[
+            "tiny",
+            "base",
+            "small",
+            "medium",
+            "large",
+            "distil-large-v3",
+            "distil-medium",
+            "large-v3",
+            "large-v3-turbo",
+        ],
+        help="Whisper model size",
+    )
+    parser.add_argument(
+        "--device",
+        default=defaults["device"],
+        choices=["auto", "cpu", "cuda"],
+        help="Device to run on",
+    )
+    parser.add_argument(
+        "--language",
+        default=defaults["language"],
+        help="Language code (e.g., en, es, fr)",
+    )
+    parser.add_argument(
+        "--hotkey",
+        default=defaults["hotkey"],
+        choices=["f12", "f11", "f10", "scroll_lock", "pause"],
+        help="Hotkey for pause/resume (default: f12)",
+    )
+    parser.add_argument(
+        "--commands",
+        action=argparse.BooleanOptionalAction,
+        default=defaults["commands"],
+        help="Enable voice command detection (window/edit/custom)",
+    )
+    parser.add_argument(
+        "--commands-file",
+        default=defaults["commands_file"],
+        help="Custom commands YAML file",
+    )
+    parser.add_argument(
+        "--command-arm",
+        action=argparse.BooleanOptionalAction,
+        default=defaults["command_arm"],
+        help='Require "command mode" to execute commands',
+    )
+    parser.add_argument(
+        "--command-arm-seconds",
+        type=int,
+        default=defaults["command_arm_seconds"],
+        help="How long command mode stays armed (seconds)",
+    )
+    parser.add_argument(
+        "--command-min-confidence",
+        type=float,
+        default=defaults["command_min_confidence"],
+        help="Minimum confidence to treat as a command",
+    )
+    parser.add_argument(
+        "--command-confirm-below",
+        type=float,
+        default=defaults["command_confirm_below"],
+        help="Ask for confirmation below this confidence",
+    )
+    parser.add_argument(
+        "--command-confirm-seconds",
+        type=float,
+        default=defaults["command_confirm_seconds"],
+        help="Time window to confirm a command",
+    )
+    parser.add_argument(
+        "--allow-shell",
+        action=argparse.BooleanOptionalAction,
+        default=defaults["allow_shell"],
+        help="Allow custom shell commands from commands.yaml",
+    )
+    parser.add_argument(
+        "--max-seconds",
+        type=int,
+        default=defaults["max_seconds"],
+        help="Max seconds per recording before forced flush",
+    )
+    parser.add_argument(
+        "--queue-size",
+        type=int,
+        default=defaults["queue_size"],
+        help="Max queued recordings before dropping",
+    )
+    parser.add_argument(
+        "--calibrate-seconds",
+        type=float,
+        default=defaults["calibrate_seconds"],
+        help="Seconds to sample ambient noise on startup",
+    )
+    parser.add_argument(
+        "--noise-gate",
+        action=argparse.BooleanOptionalAction,
+        default=defaults["noise_gate"],
+        help="Enable noise gate based on ambient noise",
+    )
+    parser.add_argument(
+        "--noise-gate-multiplier",
+        type=float,
+        default=defaults["noise_gate_multiplier"],
+        help="Noise gate threshold multiplier over noise floor",
+    )
+    parser.add_argument(
+        "--agc",
+        action=argparse.BooleanOptionalAction,
+        default=defaults["agc"],
+        help="Enable automatic gain control",
+    )
+    parser.add_argument(
+        "--agc-target-rms",
+        type=float,
+        default=defaults["agc_target_rms"],
+        help="AGC target RMS amplitude",
+    )
+    parser.add_argument(
+        "--agc-min-gain",
+        type=float,
+        default=defaults["agc_min_gain"],
+        help="AGC minimum gain",
+    )
+    parser.add_argument(
+        "--agc-max-gain",
+        type=float,
+        default=defaults["agc_max_gain"],
+        help="AGC maximum gain",
+    )
+    parser.add_argument(
+        "--adaptive-vad",
+        action=argparse.BooleanOptionalAction,
+        default=defaults["adaptive_vad"],
+        help="Enable adaptive VAD aggressiveness",
+    )
+    parser.add_argument(
+        "--notify",
+        action=argparse.BooleanOptionalAction,
+        default=defaults["notify"],
+        help="Enable desktop notifications (notify-send)",
+    )
+    parser.add_argument(
+        "--status-interval",
+        type=float,
+        default=defaults["status_interval"],
+        help="Seconds between status lines (0 to disable)",
+    )
+    parser.add_argument(
+        "--input-device",
+        default=defaults["input_device"],
+        help="Input device index or name substring",
+    )
+    parser.add_argument(
+        "--ptt",
+        action=argparse.BooleanOptionalAction,
+        default=defaults["ptt"],
+        help="Enable push-to-talk",
+    )
+    parser.add_argument(
+        "--ptt-hotkey",
+        default=defaults["ptt_hotkey"],
+        help="Push-to-talk hotkey (default: f9)",
+    )
+    parser.add_argument(
+        "--ptt-mode",
+        default=defaults["ptt_mode"],
+        choices=["hold", "toggle"],
+        help="Push-to-talk mode",
+    )
+    parser.add_argument(
+        "--log-file",
+        default=defaults["log_file"],
+        help="Log file path (empty to disable)",
+    )
+    parser.add_argument(
+        "--log-max-bytes",
+        type=int,
+        default=defaults["log_max_bytes"],
+        help="Max log size before rotation",
+    )
+    parser.add_argument(
+        "--log-backups",
+        type=int,
+        default=defaults["log_backups"],
+        help="Number of rotated logs to keep",
+    )
+    parser.add_argument(
+        "--log-level",
+        default=defaults["log_level"],
+        help="Log level (INFO, DEBUG, ERROR)",
+    )
+    parser.add_argument(
+        "--viz",
+        action=argparse.BooleanOptionalAction,
+        default=defaults["viz"],
+        help="Enable audio visualization popup",
+    )
+    parser.add_argument(
+        "--viz-position",
+        default=defaults["viz_position"],
+        choices=["top-left", "top-right", "bottom-left", "bottom-right"],
+        help="Visualization popup position",
+    )
+    parser.add_argument(
+        "--viz-hide-delay",
+        type=int,
+        default=defaults["viz_hide_delay"],
+        help="Milliseconds to wait before hiding after silence",
+    )
+    parser.add_argument(
+        "--streaming",
+        action=argparse.BooleanOptionalAction,
+        default=defaults["streaming"],
+        help="Enable streaming STT (sherpa-onnx, words appear as you speak)",
+    )
+    parser.add_argument(
+        "--streaming-model",
+        default=defaults["streaming_model"],
+        choices=["zipformer-en", "zipformer-en-20M"],
+        help="Streaming model (zipformer-en=80MB accurate, zipformer-en-20M=20MB fast)",
+    )
+    parser.add_argument(
+        "--refinement",
+        action=argparse.BooleanOptionalAction,
+        default=defaults["refinement"],
+        help="Enable Whisper refinement after streaming (adds punctuation/casing, needs GPU)",
+    )
+    parser.add_argument(
+        "--refinement-model",
+        default=defaults["refinement_model"],
+        help="Whisper model for refinement pass (default: large-v3-turbo)",
+    )
     return parser
 
 
 def main():
     pre_parser = argparse.ArgumentParser(add_help=False)
-    pre_parser.add_argument('--config', default=DEFAULT_CONFIG_PATH,
-                           help='Config file (yaml/json)')
+    pre_parser.add_argument(
+        "--config", default=DEFAULT_CONFIG_PATH, help="Config file (yaml/json)"
+    )
     pre_args, _ = pre_parser.parse_known_args()
 
     config = _load_config(pre_args.config)
@@ -1465,31 +2152,35 @@ def main():
         VoiceTyping.list_input_devices()
         return
 
-    logger = _setup_logging(args.log_file, args.log_level, args.log_max_bytes, args.log_backups)
+    logger = _setup_logging(
+        args.log_file, args.log_level, args.log_max_bytes, args.log_backups
+    )
     if logger:
         logger.info("starting voice typing")
         logger.info(
-            "config model=%s device=%s commands=%s input_device=%s ptt=%s",
+            "config model=%s device=%s commands=%s input_device=%s ptt=%s streaming=%s",
             args.model,
             args.device,
             args.commands,
             args.input_device,
             args.ptt,
+            args.streaming,
         )
 
     # Device selection
-    if args.device == 'auto':
+    if args.device == "auto":
         try:
             import torch
+
             if torch.cuda.is_available():
-                args.device = 'cuda'
+                args.device = "cuda"
                 print("CUDA available, using GPU")
             else:
-                args.device = 'cpu'
+                args.device = "cpu"
                 print("CUDA not available, using CPU")
         except ImportError:
             print("PyTorch not installed, using CPU")
-            args.device = 'cpu'
+            args.device = "cpu"
 
     # Create default commands config if commands enabled
     if args.commands and COMMANDS_AVAILABLE:
@@ -1528,6 +2219,10 @@ def main():
         viz_enabled=args.viz,
         viz_position=args.viz_position,
         viz_hide_delay=args.viz_hide_delay,
+        streaming_enabled=args.streaming,
+        streaming_model=args.streaming_model,
+        refinement_enabled=args.refinement,
+        refinement_model=args.refinement_model,
     )
 
     # Handle graceful shutdown
@@ -1542,5 +2237,5 @@ def main():
     vt.run()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

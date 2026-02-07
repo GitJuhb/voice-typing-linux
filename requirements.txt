@@ -15,3 +15,6 @@ pillow>=10.0.0  # For pyautogui screenshots
 # Audio visualization (GTK4 overlay)
 PyGObject>=3.42.0  # GTK4 Python bindings
 pycairo>=1.24.0    # Cairo drawing
+
+# Streaming STT (optional - only needed for --streaming mode)
+sherpa-onnx>=1.10.0  # Real-time streaming speech recognition

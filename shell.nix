@@ -1,4 +1,6 @@
-{ pkgs ? import <nixpkgs> {} }:
+{ pkgs ? import <nixpkgs> {
+  config.allowUnfree = true;
+} }:
 
 pkgs.mkShell {
   buildInputs = with pkgs; [
@@ -32,6 +34,12 @@ pkgs.mkShell {
     python311Packages.pygobject3
     python311Packages.pycairo
 
+    # Streaming STT (sherpa-onnx uses onnxruntime)
+    onnxruntime
+
+    # CUDA inference (cuDNN for faster-whisper/CTranslate2)
+    cudaPackages.cudnn
+
     # Build dependencies
     gcc
     pkg-config
@@ -41,7 +49,7 @@ pkgs.mkShell {
   
   shellHook = ''
     # Set up library paths
-    export LD_LIBRARY_PATH="${pkgs.stdenv.cc.cc.lib}/lib:${pkgs.zlib}/lib:$LD_LIBRARY_PATH"
+    export LD_LIBRARY_PATH="/run/opengl-driver/lib:${pkgs.cudaPackages.cudnn.lib}/lib:${pkgs.stdenv.cc.cc.lib}/lib:${pkgs.zlib}/lib:${pkgs.onnxruntime}/lib:$LD_LIBRARY_PATH"
 
     # GTK4 layer-shell must be preloaded BEFORE libwayland-client for Wayland overlays
     export LD_PRELOAD="${pkgs.gtk4-layer-shell}/lib/libgtk4-layer-shell.so''${LD_PRELOAD:+:$LD_PRELOAD}"

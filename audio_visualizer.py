@@ -12,15 +12,17 @@ import numpy as np
 import os
 
 # Check display server
-DISPLAY_SERVER = os.environ.get('XDG_SESSION_TYPE', 'x11')
+DISPLAY_SERVER = os.environ.get("XDG_SESSION_TYPE", "x11")
 
 # Pre-load GTK4 layer-shell BEFORE GTK4 (required for proper initialization)
 LAYER_SHELL_AVAILABLE = False
-if DISPLAY_SERVER == 'wayland':
+if DISPLAY_SERVER == "wayland":
     try:
         import gi
-        gi.require_version('Gtk4LayerShell', '1.0')
+
+        gi.require_version("Gtk4LayerShell", "1.0")
         from gi.repository import Gtk4LayerShell
+
         LAYER_SHELL_AVAILABLE = True
     except Exception:
         pass
@@ -74,9 +76,7 @@ class AudioVisualizer:
 
         self.running = True
         self.gtk_thread = threading.Thread(
-            target=self._gtk_main,
-            daemon=True,
-            name="AudioVisualizer"
+            target=self._gtk_main, daemon=True, name="AudioVisualizer"
         )
         self.gtk_thread.start()
         # Wait for GTK to initialize
@@ -88,8 +88,10 @@ class AudioVisualizer:
         if self.app:
             try:
                 import gi
-                gi.require_version('Gtk', '4.0')
+
+                gi.require_version("Gtk", "4.0")
                 from gi.repository import GLib
+
                 GLib.idle_add(self._quit_app)
             except Exception:
                 pass
@@ -115,8 +117,10 @@ class AudioVisualizer:
             return
         try:
             import gi
-            gi.require_version('Gtk', '4.0')
+
+            gi.require_version("Gtk", "4.0")
             from gi.repository import GLib
+
             GLib.idle_add(self._update_speaking_state, is_speaking)
         except Exception:
             pass
@@ -125,13 +129,14 @@ class AudioVisualizer:
         """GTK main loop running in dedicated thread."""
         try:
             import gi
-            gi.require_version('Gtk', '4.0')
+
+            gi.require_version("Gtk", "4.0")
             from gi.repository import Gtk, GLib, Gio
 
             # Create application
             self.app = Gtk.Application(
                 application_id="voice.typing.visualizer",
-                flags=Gio.ApplicationFlags.FLAGS_NONE
+                flags=Gio.ApplicationFlags.FLAGS_NONE,
             )
             self.app.connect("activate", self._on_activate)
 
@@ -145,7 +150,8 @@ class AudioVisualizer:
     def _on_activate(self, app):
         """GTK application activated."""
         import gi
-        gi.require_version('Gtk', '4.0')
+
+        gi.require_version("Gtk", "4.0")
         from gi.repository import Gtk, GLib
 
         self._setup_window()
@@ -159,7 +165,8 @@ class AudioVisualizer:
     def _setup_window(self):
         """Create GTK4 layer-shell window."""
         import gi
-        gi.require_version('Gtk', '4.0')
+
+        gi.require_version("Gtk", "4.0")
         from gi.repository import Gtk, Gdk
 
         # Create window
@@ -169,7 +176,9 @@ class AudioVisualizer:
         self.window.set_resizable(False)
 
         # Calculate window size
-        total_width = self.num_bars * (self.bar_width + self.bar_gap) - self.bar_gap + 20
+        total_width = (
+            self.num_bars * (self.bar_width + self.bar_gap) - self.bar_gap + 20
+        )
         self.window.set_default_size(total_width, self.window_height)
 
         # Try layer-shell for Wayland (wlroots compositors: Sway, Hyprland, etc.)
@@ -180,11 +189,15 @@ class AudioVisualizer:
                     Gtk4LayerShell.init_for_window(self.window)
                     Gtk4LayerShell.set_layer(self.window, Gtk4LayerShell.Layer.OVERLAY)
                     Gtk4LayerShell.set_namespace(self.window, "voice-typing-viz")
-                    Gtk4LayerShell.set_keyboard_mode(self.window, Gtk4LayerShell.KeyboardMode.NONE)
+                    Gtk4LayerShell.set_keyboard_mode(
+                        self.window, Gtk4LayerShell.KeyboardMode.NONE
+                    )
                     self._apply_layer_shell_position(Gtk4LayerShell)
                     use_layer_shell = True
                 else:
-                    print("Note: Layer-shell not supported (GNOME?). Using floating window.")
+                    print(
+                        "Note: Layer-shell not supported (GNOME?). Using floating window."
+                    )
             except Exception as e:
                 print(f"Layer-shell init failed: {e}")
 
@@ -213,7 +226,7 @@ class AudioVisualizer:
         Gtk.StyleContext.add_provider_for_display(
             Gdk.Display.get_default(),
             css_provider,
-            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
         )
 
         # Start hidden
@@ -245,7 +258,8 @@ class AudioVisualizer:
     def _update_speaking_state(self, is_speaking: bool):
         """GTK thread: update visibility based on speech."""
         import gi
-        gi.require_version('Gtk', '4.0')
+
+        gi.require_version("Gtk", "4.0")
         from gi.repository import GLib
 
         if is_speaking:
@@ -261,8 +275,7 @@ class AudioVisualizer:
             # Schedule hide after delay
             if self.visible and not self.hide_timer_id:
                 self.hide_timer_id = GLib.timeout_add(
-                    self.hide_delay_ms,
-                    self._hide_window
+                    self.hide_delay_ms, self._hide_window
                 )
         return False
 
@@ -322,9 +335,7 @@ class AudioVisualizer:
 
         # Logarithmic frequency bands for perceptual balance
         log_bins = np.logspace(
-            np.log10(min_bin),
-            np.log10(max_bin),
-            self.num_bars + 1
+            np.log10(min_bin), np.log10(max_bin), self.num_bars + 1
         ).astype(int)
 
         bars = np.zeros(self.num_bars)
@@ -350,7 +361,7 @@ class AudioVisualizer:
             bars = self.spectrum_data.copy()
 
         # Colors (gradient from cyan to magenta based on magnitude)
-        color_low = (0.2, 0.7, 0.9)   # Cyan for low
+        color_low = (0.2, 0.7, 0.9)  # Cyan for low
         color_high = (0.9, 0.2, 0.6)  # Magenta for high
 
         bar_total_width = self.bar_width + self.bar_gap
@@ -375,6 +386,7 @@ class AudioVisualizer:
     def _rounded_rect(self, ctx, x, y, w, h, r):
         """Draw rounded rectangle path."""
         import math
+
         ctx.new_path()
         ctx.arc(x + r, y + r, r, math.pi, 1.5 * math.pi)
         ctx.arc(x + w - r, y + r, r, 1.5 * math.pi, 2 * math.pi)

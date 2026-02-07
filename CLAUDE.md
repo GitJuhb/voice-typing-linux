@@ -93,12 +93,35 @@ Press **F12** (default) to pause/resume transcription.
 
 The visualizer shows an FFT spectrum analyzer overlay that appears when speech is detected and auto-hides after silence. Uses GTK4 with layer-shell for Wayland overlay support.
 
+### Streaming STT (Two-Pass)
+```bash
+# Enable streaming mode (words appear as you speak)
+./voice --streaming
+
+# Use smaller streaming model (~20MB instead of ~80MB)
+./voice --streaming --streaming-model zipformer-en-20M
+
+# Custom refinement model
+./voice --streaming --refinement-model large-v3-turbo
+```
+
+Two-pass architecture for low-latency dictation:
+- **Pass 1 (sherpa-onnx)**: Streaming zipformer transducer processes each 20ms audio chunk in real-time, typing partial results immediately with backspace correction as partials change
+- **Pass 2 (faster-whisper turbo)**: After endpoint detection (silence), the accumulated audio is sent to faster-whisper large-v3-turbo for refinement. If the result differs, the streaming text is backspaced and replaced
+
+First run downloads models automatically:
+- Streaming model: `~/.cache/sherpa-onnx/` (~80MB zipformer-en, ~20MB zipformer-en-20M)
+- Refinement model: `~/.cache/huggingface/` (~1.5GB large-v3-turbo)
+
+Without `--streaming`, behavior is identical to the existing batch mode.
+
 ### Configuration
 Default config: `${XDG_CONFIG_HOME:-~/.config}/voice-typing/config.yaml`
 
 Environment overrides (prefix `VOICE_`): `VOICE_MODEL`, `VOICE_DEVICE`, `VOICE_HOTKEY`,
 `VOICE_COMMANDS`, `VOICE_NOISE_GATE`, `VOICE_PTT`, `VOICE_LOG_FILE`,
-`VOICE_ADAPTIVE_VAD` (or legacy `VOICE_NO_ADAPTIVE_VAD`).
+`VOICE_ADAPTIVE_VAD` (or legacy `VOICE_NO_ADAPTIVE_VAD`),
+`VOICE_STREAMING`, `VOICE_STREAMING_MODEL`, `VOICE_REFINEMENT_MODEL`.
 
 ### Logs
 ```bash
@@ -258,6 +281,7 @@ Phrases that look like sentences are typed as dictation:
 
 ### Core Files
 - `enhanced-voice-typing.py` - Main implementation
+- `streaming_stt.py` - Streaming STT wrapper for sherpa-onnx (optional)
 - `commands.py` - Voice command detection and execution
 - `audio_visualizer.py` - GTK4 spectrum analyzer overlay
 - `voice` - Launcher script with defaults
@@ -266,19 +290,20 @@ Phrases that look like sentences are typed as dictation:
 - `ydotool-service.nix` - NixOS ydotool daemon (future)
 
 ### Threading Model
-The application uses a **producer-consumer pattern** with up to 5 threads:
+The application uses a **producer-consumer pattern** with up to 6 threads:
 
 1. **Audio Callback Thread** (PyAudio) - Fast, non-blocking
    - Runs VAD on each 20ms chunk
    - Manages pre-buffer (circular deque)
    - Queues completed recordings for transcription
+   - In streaming mode, also pushes chunks to streaming queue
    - Checks `is_paused` flag
    - Protected by `buffer_lock`
 
 2. **Transcription Worker Thread** - Background processing
    - Pulls audio from `transcription_queue`
-   - Runs Whisper inference (1-2s)
-   - Types result via xdotool
+   - Batch mode: runs Whisper inference (1-2s), types result
+   - Streaming mode: acts as refinement pass, compares turbo result with streaming text
 
 3. **Hotkey Listener Thread** (pynput) - Global hotkey
    - Toggles `is_paused` flag
@@ -293,6 +318,13 @@ The application uses a **producer-consumer pattern** with up to 5 threads:
    - Computes FFT spectrum at ~30fps
    - Auto-shows on speech, hides after silence delay
 
+6. **Streaming Worker Thread** (sherpa-onnx) - Real-time STT (optional, --streaming)
+   - Consumes 20ms chunks from `streaming_queue`
+   - Feeds sherpa-onnx OnlineRecognizer for partial results
+   - Types partials incrementally with backspace correction
+   - On endpoint detection, queues audio for refinement (thread 2)
+   - Protected by `streaming_lock` for `current_streaming_text`
+
 ### Audio Pipeline
 1. **Pre-Buffer**: Circular buffer holds 600ms (30 chunks × 20ms)
 2. **VAD Detection**: WebRTC VAD (aggressiveness=2) detects speech
@@ -302,12 +334,15 @@ The application uses a **producer-consumer pattern** with up to 5 threads:
 6. **Output**: xdotool types transcribed text
 
 ### Key Code Locations
-- `VoiceTyping` class: `enhanced-voice-typing.py:55`
-- Hotkey toggle: `enhanced-voice-typing.py:171`
-- Socket listener: `enhanced-voice-typing.py:226`
-- Audio callback: `enhanced-voice-typing.py:264`
-- Transcription worker: `enhanced-voice-typing.py:310`
-- Whisper transcription: `enhanced-voice-typing.py:322`
+- `VoiceTyping` class: `enhanced-voice-typing.py:302`
+- Hotkey toggle: `enhanced-voice-typing.py:603`
+- Socket listener: `enhanced-voice-typing.py:692`
+- Audio callback: `enhanced-voice-typing.py:996`
+- Transcription worker: `enhanced-voice-typing.py:1108`
+- Whisper transcription: `enhanced-voice-typing.py:1129`
+- Streaming worker: `enhanced-voice-typing.py:1295`
+- Streaming partial typing: `enhanced-voice-typing.py:1356`
+- StreamingSTT class: `streaming_stt.py:50`
 
 ## Whisper Settings (Accuracy-Optimized)
 
