@@ -15,6 +15,7 @@ pkgs.mkShell {
     ydotool
     xdotool
     wmctrl     # Window focus commands
+    wl-clipboard  # Clipboard paste for refinement corrections
     netcat     # Socket toggle (voice-toggle)
     xbindkeys  # Wayland hotkey fallback
     portaudio  # For pyaudio
@@ -45,11 +46,16 @@ pkgs.mkShell {
     pkg-config
     stdenv.cc.cc.lib
     zlib
+    linuxHeaders  # For python-evdev (uinput key injection)
   ];
   
   shellHook = ''
     # Set up library paths
     export LD_LIBRARY_PATH="/run/opengl-driver/lib:${pkgs.cudaPackages.cudnn.lib}/lib:${pkgs.stdenv.cc.cc.lib}/lib:${pkgs.zlib}/lib:${pkgs.onnxruntime}/lib:$LD_LIBRARY_PATH"
+
+    # Linux headers for python-evdev build
+    export EVDEV_HEADERS="${pkgs.linuxHeaders}/include/linux/input.h:${pkgs.linuxHeaders}/include/linux/input-event-codes.h"
+    export C_INCLUDE_PATH="${pkgs.linuxHeaders}/include:$C_INCLUDE_PATH"
 
     # GTK4 layer-shell must be preloaded BEFORE libwayland-client for Wayland overlays
     export LD_PRELOAD="${pkgs.gtk4-layer-shell}/lib/libgtk4-layer-shell.so''${LD_PRELOAD:+:$LD_PRELOAD}"

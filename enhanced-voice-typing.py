@@ -70,6 +70,197 @@ try:
 except ImportError:
     STREAMING_AVAILABLE = False
 
+# Direct uinput key injection (replaces ydotool for Wayland)
+try:
+    import evdev
+    from evdev import UInput, ecodes
+    import struct
+
+    EVDEV_AVAILABLE = True
+except ImportError:
+    EVDEV_AVAILABLE = False
+
+
+class FastKeyInjector:
+    """Direct /dev/uinput key injection — sub-frame speed, no ydotool daemon.
+
+    Writes all key events in a single write() syscall. 30 backspaces take ~0.3ms
+    kernel processing time vs ~50-100ms through ydotool's socket IPC.
+    """
+
+    # Keycode mapping for typing printable characters via uinput.
+    # Maps characters to (keycode, shift_needed) tuples.
+    _CHAR_TO_KEY = {}
+
+    # Build character map from evdev key names
+    _UNSHIFTED = "`1234567890-=qwertyuiop[]\\asdfghjkl;'zxcvbnm,./ "
+    _SHIFTED = '~!@#$%^&*()_+QWERTYUIOP{}|ASDFGHJKL:"ZXCVBNM<>? '
+    _KEYCODES = [
+        # Row 1: ` 1-0 - =
+        41,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        # Row 2: q-p [ ] backslash
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        43,
+        # Row 3: a-l ; '
+        30,
+        31,
+        32,
+        33,
+        34,
+        35,
+        36,
+        37,
+        38,
+        39,
+        40,
+        # Row 4: z-m , . / space
+        44,
+        45,
+        46,
+        47,
+        48,
+        49,
+        50,
+        51,
+        52,
+        53,
+        57,
+    ]
+
+    for _i, _ch in enumerate(_UNSHIFTED):
+        _CHAR_TO_KEY[_ch] = (_KEYCODES[_i], False)
+    for _i, _ch in enumerate(_SHIFTED):
+        if _ch != " ":  # space already mapped
+            _CHAR_TO_KEY[_ch] = (_KEYCODES[_i], True)
+
+    # Special keys
+    _CHAR_TO_KEY["\n"] = (28, False)  # KEY_ENTER
+    _CHAR_TO_KEY["\t"] = (15, False)  # KEY_TAB
+
+    KEY_BACKSPACE = 14
+    KEY_LEFT = 105
+    KEY_LSHIFT = 42
+    KEY_LCTRL = 29
+    KEY_V = 47
+
+    def __init__(self):
+        cap = {ecodes.EV_KEY: list(range(1, 249))}
+        self.ui = UInput(cap, name="voice-typing-kbd")
+        self._event_struct = struct.Struct("llHHi")  # struct input_event (64-bit)
+
+    def _make_event(self, etype, ecode, value):
+        """Create raw input_event bytes."""
+        return self._event_struct.pack(0, 0, etype, ecode, value)
+
+    def _build_key_events(self, keycode, pressed):
+        """Build press/release + SYN_REPORT as raw bytes."""
+        ev = self._make_event(ecodes.EV_KEY, keycode, 1 if pressed else 0)
+        syn = self._make_event(ecodes.EV_SYN, ecodes.SYN_REPORT, 0)
+        return ev + syn
+
+    def send_backspaces(self, count):
+        """Send N backspaces, batched in groups for terminal compatibility.
+
+        Terminals (Ghostty, kitty, etc.) can't process 50+ backspaces in a
+        single ~0.3ms burst — their input loops miss events. We batch in
+        groups of 10 with a tiny sleep between batches. Still completes
+        100 backspaces in ~3ms (well under one 16ms display frame).
+        GUI apps handle the burst fine regardless.
+        """
+        if count <= 0:
+            return
+        batch_size = 10
+        remaining = count
+        while remaining > 0:
+            n = min(remaining, batch_size)
+            buf = bytearray()
+            for _ in range(n):
+                buf.extend(self._build_key_events(self.KEY_BACKSPACE, True))
+                buf.extend(self._build_key_events(self.KEY_BACKSPACE, False))
+            os.write(self.ui.fd, bytes(buf))
+            remaining -= n
+            if remaining > 0:
+                time.sleep(0.0003)  # 0.3ms between batches
+
+    def type_text(self, text):
+        """Type a string by emitting key events for each character.
+
+        All events are written in a single write() syscall for sub-frame speed.
+        Characters not in the keymap are silently skipped.
+        """
+        if not text:
+            return
+        buf = bytearray()
+        for ch in text:
+            mapping = self._CHAR_TO_KEY.get(ch)
+            if mapping is None:
+                continue
+            keycode, shift = mapping
+            if shift:
+                buf.extend(self._build_key_events(self.KEY_LSHIFT, True))
+            buf.extend(self._build_key_events(keycode, True))
+            buf.extend(self._build_key_events(keycode, False))
+            if shift:
+                buf.extend(self._build_key_events(self.KEY_LSHIFT, False))
+        if buf:
+            os.write(self.ui.fd, bytes(buf))
+
+    def replace_text(self, chars_to_delete, new_text):
+        """Replace text in a single write() syscall — true sub-frame atomic.
+
+        Both deletion and insertion happen in one kernel call.
+        This works perfectly in GUI apps (browsers, editors). For terminals,
+        use send_backspaces() + type_text() separately instead.
+        """
+        buf = bytearray()
+        for _ in range(chars_to_delete):
+            buf.extend(self._build_key_events(self.KEY_BACKSPACE, True))
+            buf.extend(self._build_key_events(self.KEY_BACKSPACE, False))
+        for ch in new_text:
+            mapping = self._CHAR_TO_KEY.get(ch)
+            if mapping is None:
+                continue
+            keycode, shift = mapping
+            if shift:
+                buf.extend(self._build_key_events(self.KEY_LSHIFT, True))
+            buf.extend(self._build_key_events(keycode, True))
+            buf.extend(self._build_key_events(keycode, False))
+            if shift:
+                buf.extend(self._build_key_events(self.KEY_LSHIFT, False))
+        if buf:
+            os.write(self.ui.fd, bytes(buf))
+
+    def close(self):
+        """Release the uinput device."""
+        try:
+            self.ui.close()
+        except Exception:
+            pass
+
+
 # Hotkey name to pynput format mapping
 HOTKEY_MAP = {
     "f12": "<f12>",
@@ -365,15 +556,29 @@ class VoiceTyping:
         self.display_server = detect_display_server()
         print(f"🖥️  Display server: {self.display_server.upper()}")
 
-        # Check ydotool daemon for Wayland
+        # Initialize key injection backend
+        self.key_injector = None
         if self.display_server == "wayland":
-            if check_ydotool_daemon():
-                print(f"✅ ydotoold daemon running")
+            if EVDEV_AVAILABLE:
+                try:
+                    self.key_injector = FastKeyInjector()
+                    print(f"✅ Direct uinput key injection (sub-frame speed)")
+                except Exception as e:
+                    print(f"⚠️  Failed to create uinput device: {e}")
+                    print(f"   Falling back to ydotool (needs ydotoold)")
+                    if check_ydotool_daemon():
+                        print(f"✅ ydotoold daemon running")
+                    else:
+                        print(f"❌ ydotoold daemon NOT running!")
+                        print(f"   Start with: sudo ydotoold &")
             else:
-                print(f"❌ ydotoold daemon NOT running!")
-                print(f"   Keyboard input won't work without it.")
-                print(f"   Start with: sudo ydotoold &")
-                print(f"   Or enable NixOS service from ydotool-service.nix")
+                print(f"⚠️  python-evdev not installed, using ydotool fallback")
+                if check_ydotool_daemon():
+                    print(f"✅ ydotoold daemon running")
+                else:
+                    print(f"❌ ydotoold daemon NOT running!")
+                    print(f"   Keyboard input won't work without it.")
+                    print(f"   Start with: sudo ydotoold &")
 
         # Initialize command detection if enabled
         self.command_detector = None
@@ -1160,22 +1365,28 @@ class VoiceTyping:
                 print("⚡ Transcribing...")
             start_time = time.time()
 
-            prompt = (
+            batch_prompt = (
                 self.previous_text[-200:]
                 if self.previous_text
                 else "Clear speech dictation."
             )
 
             if is_refinement:
-                # Refinement pass: fast turbo with beam_size=1
-                # VAD filter ON because streaming audio buffer includes silence
+                # Refinement pass: turbo with beam_size=3 for reliability.
+                # Uses clean prompt (only refined text, not streaming errors)
+                # to prevent hallucination like "you" / "so" on long segments.
+                refinement_prompt = (
+                    self.previous_text[-200:]
+                    if self.previous_text
+                    else "Clear, well-punctuated dictation."
+                )
                 segments, info = self.model.transcribe(
                     audio_float,
                     language=self.language or "en",
-                    initial_prompt=prompt,
+                    initial_prompt=refinement_prompt,
                     temperature=0.0,
-                    beam_size=1,
-                    condition_on_previous_text=True,
+                    beam_size=3,
+                    condition_on_previous_text=False,
                     without_timestamps=True,
                     vad_filter=True,
                     vad_parameters=dict(
@@ -1188,7 +1399,7 @@ class VoiceTyping:
                 segments, info = self.model.transcribe(
                     audio_float,
                     language=self.language or "en",
-                    initial_prompt=prompt,
+                    initial_prompt=batch_prompt,
                     temperature=0.0,
                     beam_size=5,
                     condition_on_previous_text=True,
@@ -1255,20 +1466,30 @@ class VoiceTyping:
                             chars_to_delete = len(streaming_text) - common_len
                             new_suffix = text[common_len:]
 
-                            max_bs = 30
-                            if common_len == 0 and len(text) < len(streaming_text):
+                            max_replace = 100
+                            # Only reject if refined text has almost no word overlap
+                            # (protects against hallucination, but allows start-trimming)
+                            stream_words = set(streaming_text.lower().split())
+                            refined_words = set(text.lower().split())
+                            word_overlap = len(stream_words & refined_words)
+                            no_overlap = (
+                                common_len == 0
+                                and word_overlap <= 1
+                                and len(text) < len(streaming_text)
+                            )
+                            if no_overlap:
                                 print(
-                                    f"⚠️  [{transcribe_time:.2f}s] Rejected refinement (trimmed start): '{streaming_text}' -> '{text}'"
+                                    f"⚠️  [{transcribe_time:.2f}s] Rejected refinement (no overlap): '{streaming_text}' -> '{text}'"
                                 )
                                 self._log(
-                                    f"refinement_rejected streaming='{streaming_text}' refined='{text}' reason=trimmed_start"
+                                    f"refinement_rejected streaming='{streaming_text}' refined='{text}' reason=no_overlap"
                                 )
-                            elif chars_to_delete > max_bs:
+                            elif chars_to_delete > max_replace:
                                 print(
-                                    f"⚠️  [{transcribe_time:.2f}s] Skipped refinement (bs={chars_to_delete}>{max_bs}): '{streaming_text}' -> '{text}'"
+                                    f"⚠️  [{transcribe_time:.2f}s] Skipped refinement (replace={chars_to_delete}>{max_replace}): '{streaming_text}' -> '{text}'"
                                 )
                                 self._log(
-                                    f"refinement_skipped streaming='{streaming_text}' refined='{text}' reason=bs_too_large bs={chars_to_delete}"
+                                    f"refinement_skipped streaming='{streaming_text}' refined='{text}' reason=replace_too_large chars={chars_to_delete}"
                                 )
                             else:
                                 print(
@@ -1277,10 +1498,17 @@ class VoiceTyping:
                                 self._log(
                                     f"refinement_correction streaming='{streaming_text}' refined='{text}' bs={chars_to_delete}"
                                 )
-                                if chars_to_delete > 0:
-                                    self._send_backspaces(chars_to_delete)
-                                if new_suffix:
-                                    self._type_raw(new_suffix)
+                                # Single syscall: backspace + retype in one write()
+                                if chars_to_delete > 0 or new_suffix:
+                                    if self.key_injector:
+                                        self.key_injector.replace_text(
+                                            chars_to_delete, new_suffix
+                                        )
+                                    else:
+                                        if chars_to_delete > 0:
+                                            self._send_backspaces(chars_to_delete)
+                                        if new_suffix:
+                                            self._type_raw(new_suffix)
                 else:
                     print(f"✅ [{transcribe_time:.2f}s] '{text}'")
 
@@ -1372,7 +1600,7 @@ class VoiceTyping:
 
         Drains all available chunks in a batch, feeds them to sherpa-onnx,
         then updates the display once. Throttles typing to ~150ms intervals
-        to prevent ydotool subprocess pileup.
+        to prevent rapid-fire corrections.
         When an endpoint is detected, queues the full audio for refinement.
         """
         # Accumulate chunks for refinement pass
@@ -1467,7 +1695,12 @@ class VoiceTyping:
                     self.typing_history.append((streamed, len(streamed)))
                     if len(self.typing_history) > self.max_history:
                         self.typing_history.pop(0)
-                    self.previous_text = (self.previous_text + " " + streamed)[-500:]
+                    # Only update previous_text from streaming if no refinement
+                    # (refinement path updates it with higher-quality text)
+                    if not self.refinement_enabled:
+                        self.previous_text = (self.previous_text + " " + streamed)[
+                            -500:
+                        ]
                     needs_leading_space = True  # Next utterance gets a space prefix
 
                 # Reset prefix for next utterance
@@ -1544,9 +1777,10 @@ class VoiceTyping:
         if count <= 0:
             return
         try:
-            if self.display_server == "wayland":
+            if self.key_injector:
+                self.key_injector.send_backspaces(count)
+            elif self.display_server == "wayland":
                 env = self._ydotool_env()
-                # ydotool key: 14 = BackSpace keycode
                 key_args = []
                 for _ in range(count):
                     key_args.extend(["14:1", "14:0"])
@@ -1556,7 +1790,7 @@ class VoiceTyping:
                     ["xdotool", "key", "--repeat", str(count), "BackSpace"],
                     check=True,
                 )
-        except subprocess.CalledProcessError as e:
+        except Exception as e:
             print(f"Backspace error: {e}")
 
     def _type_raw(self, text: str):
@@ -1564,7 +1798,9 @@ class VoiceTyping:
         if not text:
             return
         try:
-            if self.display_server == "wayland":
+            if self.key_injector:
+                self.key_injector.type_text(text)
+            elif self.display_server == "wayland":
                 subprocess.run(
                     ["ydotool", "type", "-d", "0", "-H", "0", "--", text],
                     check=True,
@@ -1572,7 +1808,7 @@ class VoiceTyping:
                 )
             else:
                 subprocess.run(["xdotool", "type", "--delay", "0", text], check=True)
-        except subprocess.CalledProcessError as e:
+        except Exception as e:
             print(f"Type error: {e}")
 
     def _replace_typed_text(self, old_text: str, new_text: str):
@@ -1581,11 +1817,13 @@ class VoiceTyping:
             self._type_raw(new_text)
             return
 
-        # Backspace the old text
-        self._send_backspaces(len(old_text))
-        # Type the new text
-        if new_text:
-            self._type_raw(new_text)
+        if self.key_injector:
+            # Single write() syscall: backspace + retype in one kernel call
+            self.key_injector.replace_text(len(old_text), new_text)
+        else:
+            self._send_backspaces(len(old_text))
+            if new_text:
+                self._type_raw(new_text)
 
     def _ydotool_env(self):
         """Get environment with ydotool socket path set"""
@@ -1668,17 +1906,17 @@ class VoiceTyping:
         print(f"🤔 Confirm command '{action}'? Say 'confirm' or 'cancel'.")
 
     def type_text(self, text):
-        """Type text using xdotool (X11) or ydotool (Wayland)"""
+        """Type text using direct uinput (Wayland), ydotool fallback, or xdotool (X11)"""
         try:
-            if self.display_server == "wayland":
-                # ydotool for Wayland (--key-delay=0 --key-hold=0 for instant typing)
+            if self.key_injector:
+                self.key_injector.type_text(text)
+            elif self.display_server == "wayland":
                 subprocess.run(
                     ["ydotool", "type", "-d", "0", "-H", "0", "--", text],
                     check=True,
                     env=self._ydotool_env(),
                 )
             else:
-                # xdotool for X11
                 subprocess.run(["xdotool", "type", "--delay", "0", text], check=True)
             print(f"⌨️  Typed: '{text}'")
 
@@ -1687,32 +1925,18 @@ class VoiceTyping:
             if len(self.typing_history) > self.max_history:
                 self.typing_history.pop(0)
 
-        except subprocess.CalledProcessError as e:
+        except Exception as e:
             print(f"❌ Failed to type: {e}")
-        except FileNotFoundError:
-            tool = "ydotool" if self.display_server == "wayland" else "xdotool"
-            print(f"❌ {tool} not found")
 
     def _scratch_that(self):
         """Delete last typed text by sending backspaces."""
         if self.typing_history:
             last_text, char_count = self.typing_history.pop()
             try:
-                if self.display_server == "wayland":
-                    # ydotool key syntax: repeat backspace
-                    env = self._ydotool_env()
-                    for _ in range(char_count):
-                        subprocess.run(
-                            ["ydotool", "key", "14:1", "14:0"], check=True, env=env
-                        )  # 14 = BackSpace keycode
-                else:
-                    subprocess.run(
-                        ["xdotool", "key", "--repeat", str(char_count), "BackSpace"],
-                        check=True,
-                    )
+                self._send_backspaces(char_count)
                 print(f"🔙 Scratched: '{last_text}'")
                 return True
-            except subprocess.CalledProcessError as e:
+            except Exception as e:
                 print(f"❌ Failed to scratch: {e}")
                 return False
         else:
@@ -1829,6 +2053,13 @@ class VoiceTyping:
         if os.path.exists(TOKEN_PATH):
             try:
                 os.remove(TOKEN_PATH)
+            except:
+                pass
+
+        # Release uinput device
+        if self.key_injector:
+            try:
+                self.key_injector.close()
             except:
                 pass
 

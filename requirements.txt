@@ -12,6 +12,9 @@ pyautogui>=0.9.54  # Alternative keyboard input
 python-xlib>=0.33  # Required by pyautogui on Linux
 pillow>=10.0.0  # For pyautogui screenshots
 
+# Direct uinput key injection (replaces ydotool for Wayland)
+evdev>=1.6.0
+
 # Audio visualization (GTK4 overlay)
 PyGObject>=3.42.0  # GTK4 Python bindings
 pycairo>=1.24.0    # Cairo drawing
