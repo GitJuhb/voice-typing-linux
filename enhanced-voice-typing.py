@@ -304,10 +304,9 @@ class IBusClient:
       replace:N:TEXT   - delete N chars then commit TEXT
     """
 
-    SOCKET_PATH = os.path.join(
-        os.environ.get("XDG_RUNTIME_DIR", "/tmp"),
-        f"voice-typing-ibus-{os.getuid()}.sock",
-    )
+    _RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR", "/tmp")
+    SOCKET_PATH = os.path.join(_RUNTIME_DIR, f"voice-typing-ibus-{os.getuid()}.sock")
+    CAPS_PATH = os.path.join(_RUNTIME_DIR, f"voice-typing-ibus-caps-{os.getuid()}")
 
     def __init__(self):
         self._sock = None
@@ -317,6 +316,15 @@ class IBusClient:
     def is_available(self):
         """Check if IBus engine socket exists."""
         return os.path.exists(self.SOCKET_PATH)
+
+    @property
+    def supports_surrounding_text(self):
+        """Check if focused app supports delete_surrounding_text (browsers do, terminals don't)."""
+        try:
+            with open(self.CAPS_PATH) as f:
+                return f.read().strip() == "surrounding"
+        except (OSError, FileNotFoundError):
+            return False
 
     def _ensure_connected(self):
         if self._sock is not None:
@@ -669,9 +677,11 @@ class VoiceTyping:
 
         # IBus client for atomic text insertion (preferred over key injection)
         self.ibus_client = IBusClient()
-        self._pending_refinement_text = None  # Preedit text awaiting refinement commit
+        self._pending_refinement_text = (
+            None  # Terminal: preedit text awaiting refinement
+        )
         self._pending_refinement_prefix = (
-            ""  # Leading space prefix for inter-utterance spacing
+            ""  # Leading space for inter-utterance spacing
         )
         if self.ibus_client.is_available:
             print("✅ IBus engine available (atomic text insertion)")
@@ -1558,9 +1568,8 @@ class VoiceTyping:
                     streaming_normalized = " ".join(streaming_text.lower().split())
                     refined_normalized = " ".join(text.lower().split())
 
-                    # IBus preedit path: text is still in preedit (underlined),
-                    # so we just clear preedit and commit the final version atomically.
-                    # No delete_surrounding_text needed (many apps don't support it).
+                    # IBus preedit path: text is still in preedit,
+                    # clear preedit and commit the final version atomically.
                     ibus_preedit = (
                         self.ibus_client.is_available
                         and self._pending_refinement_text is not None
@@ -1868,8 +1877,8 @@ class VoiceTyping:
                         and self.refinement_enabled
                         and refinement_text
                     ):
-                        # IBus + refinement: keep text as preedit until refinement commits.
-                        # This avoids delete_surrounding_text which many apps don't support.
+                        # Keep text as preedit until refinement commits.
+                        # Preedit is plain in browsers (no underline), underlined in terminals.
                         self._pending_refinement_text = refinement_text
                         self._pending_refinement_prefix = space_prefix
                     elif self.ibus_client.is_available:
@@ -1945,7 +1954,6 @@ class VoiceTyping:
                 self.ibus_client.send_commit(prefix + self._pending_refinement_text)
                 self._pending_refinement_text = None
                 self._pending_refinement_prefix = ""
-
             # IBus path: atomic preedit update (no LCP diff needed)
             if self.ibus_client.is_available and self.ibus_client.send_preedit(
                 new_partial

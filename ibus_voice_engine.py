@@ -31,6 +31,7 @@ from gi.repository import IBus, GLib
 
 RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR", "/tmp")
 IBUS_SOCKET_PATH = os.path.join(RUNTIME_DIR, f"voice-typing-ibus-{os.getuid()}.sock")
+IBUS_CAPS_PATH = os.path.join(RUNTIME_DIR, f"voice-typing-ibus-caps-{os.getuid()}")
 
 # Global reference to the active engine instance (set by factory)
 _active_engine = None
@@ -44,6 +45,7 @@ class VoiceTypingEngine(IBus.Engine):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self._enabled = False
+        self._surrounding = False
 
     def do_process_key_event(self, keyval, keycode, state):
         """Pass through all keyboard events — we only inject text, not intercept keys."""
@@ -58,11 +60,25 @@ class VoiceTypingEngine(IBus.Engine):
         self._hide_preedit()
         print("IBus VoiceTyping engine disabled")
 
+    def do_set_capabilities(self, caps):
+        """Track client capabilities — especially surrounding text support."""
+        self._surrounding = bool(caps & IBus.Capabilite.SURROUNDING_TEXT)
+        self._write_caps()
+        print(f"Client caps: surrounding_text={self._surrounding} (0x{caps:x})")
+
     def do_focus_in(self):
-        pass
+        self._write_caps()
 
     def do_focus_out(self):
         self._hide_preedit()
+
+    def _write_caps(self):
+        """Write current capabilities to file for voice typing script."""
+        try:
+            with open(IBUS_CAPS_PATH, "w") as f:
+                f.write("surrounding\n" if self._surrounding else "basic\n")
+        except OSError:
+            pass
 
     def do_reset(self):
         self._hide_preedit()
@@ -73,14 +89,16 @@ class VoiceTypingEngine(IBus.Engine):
         self.commit_text(ibus_text)
 
     def preedit(self, text):
-        """Show preedit (underlined preview) text."""
+        """Show preedit preview text. Underlined in terminals, plain in browsers."""
         if not text:
             self._hide_preedit()
             return
         ibus_text = IBus.Text.new_from_string(text)
-        ibus_text.append_attribute(
-            IBus.AttrType.UNDERLINE, IBus.AttrUnderline.SINGLE, 0, len(text)
-        )
+        if not self._surrounding:
+            # Terminal: underline as visual indicator that refinement is pending
+            ibus_text.append_attribute(
+                IBus.AttrType.UNDERLINE, IBus.AttrUnderline.SINGLE, 0, len(text)
+            )
         self.update_preedit_text_with_mode(
             ibus_text, len(text), True, IBus.PreeditFocusMode.CLEAR
         )
@@ -216,11 +234,12 @@ def _socket_listener():
 
 
 def _cleanup():
-    if os.path.exists(IBUS_SOCKET_PATH):
-        try:
-            os.remove(IBUS_SOCKET_PATH)
-        except Exception:
-            pass
+    for path in (IBUS_SOCKET_PATH, IBUS_CAPS_PATH):
+        if os.path.exists(path):
+            try:
+                os.remove(path)
+            except Exception:
+                pass
 
 
 def main():
