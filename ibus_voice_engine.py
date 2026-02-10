@@ -106,17 +106,25 @@ class VoiceTypingEngineFactory(IBus.Factory):
 
     __gtype_name__ = "VoiceTypingEngineFactory"
 
+    _engine_count = 0
+
     def __init__(self, bus):
         self._bus = bus
         super().__init__(object_path=IBus.PATH_FACTORY, connection=bus.get_connection())
 
     def do_create_engine(self, engine_name):
         global _active_engine
+        VoiceTypingEngineFactory._engine_count += 1
+        obj_path = (
+            f"/org/freedesktop/IBus/Engine/{VoiceTypingEngineFactory._engine_count}"
+        )
         engine = VoiceTypingEngine(
-            engine_name=engine_name, object_path=IBus.PATH_ENGINE
+            engine_name=engine_name,
+            object_path=obj_path,
+            connection=self._bus.get_connection(),
         )
         _active_engine = engine
-        print(f"Created engine: {engine_name}")
+        print(f"Created engine: {engine_name} at {obj_path}")
         return engine
 
 
@@ -247,8 +255,15 @@ def main():
     component.add_engine(engine_desc)
 
     factory = VoiceTypingEngineFactory(bus)
-    bus.register_component(component)
-    bus.request_name("org.freedesktop.IBus.VoiceTyping", 0)
+    rc = bus.register_component(component)
+    print(f"register_component: {rc}")
+    rn = bus.request_name("org.freedesktop.IBus.VoiceTyping", 0)
+    print(f"request_name: {rn}")
+
+    # Try to verify the engine is listed
+    engines = bus.list_engines()
+    found = [e.get_name() for e in engines if "voice" in e.get_name().lower()]
+    print(f"Engines with 'voice': {found}")
 
     # Start socket listener in background thread
     socket_thread = threading.Thread(

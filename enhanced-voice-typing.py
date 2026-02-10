@@ -669,6 +669,10 @@ class VoiceTyping:
 
         # IBus client for atomic text insertion (preferred over key injection)
         self.ibus_client = IBusClient()
+        self._pending_refinement_text = None  # Preedit text awaiting refinement commit
+        self._pending_refinement_prefix = (
+            ""  # Leading space prefix for inter-utterance spacing
+        )
         if self.ibus_client.is_available:
             print("✅ IBus engine available (atomic text insertion)")
         else:
@@ -1554,7 +1558,21 @@ class VoiceTyping:
                     streaming_normalized = " ".join(streaming_text.lower().split())
                     refined_normalized = " ".join(text.lower().split())
 
+                    # IBus preedit path: text is still in preedit (underlined),
+                    # so we just clear preedit and commit the final version atomically.
+                    # No delete_surrounding_text needed (many apps don't support it).
+                    ibus_preedit = (
+                        self.ibus_client.is_available
+                        and self._pending_refinement_text is not None
+                    )
+
                     if streaming_normalized == refined_normalized:
+                        if ibus_preedit:
+                            prefix = self._pending_refinement_prefix
+                            self._pending_refinement_text = None
+                            self._pending_refinement_prefix = ""
+                            self.ibus_client.send_preedit("")
+                            self.ibus_client.send_commit(prefix + text)
                         print(f"✅ [{transcribe_time:.2f}s] Confirmed: '{text}'")
                     else:
                         # Sanity check: reject refinement if output is much shorter
@@ -1569,7 +1587,21 @@ class VoiceTyping:
                         with self.streaming_lock:
                             new_streaming = self.current_streaming_text
 
+                        # Only reject if refined text has almost no word overlap
+                        stream_words = set(streaming_text.lower().split())
+                        refined_words = set(text.lower().split())
+                        word_overlap = len(stream_words & refined_words)
+                        no_overlap = word_overlap <= 1 and len(text) < len(
+                            streaming_text
+                        )
+
                         if too_short:
+                            if ibus_preedit:
+                                prefix = self._pending_refinement_prefix
+                                self._pending_refinement_text = None
+                                self._pending_refinement_prefix = ""
+                                self.ibus_client.send_preedit("")
+                                self.ibus_client.send_commit(prefix + streaming_text)
                             print(
                                 f"⚠️  [{transcribe_time:.2f}s] Rejected refinement (too short {refined_word_count}/{stream_word_count} words): '{streaming_text}' -> '{text}'"
                             )
@@ -1577,14 +1609,35 @@ class VoiceTyping:
                                 f"refinement_rejected streaming='{streaming_text}' refined='{text}' reason=too_short"
                             )
                         elif new_streaming:
+                            # User moved on — _type_streaming_partial will commit pending
                             print(
                                 f"⏭️  [{transcribe_time:.2f}s] Skipped correction (user moved on): '{streaming_text}' -> '{text}'"
                             )
                             self._log(
                                 f"refinement_skipped streaming='{streaming_text}' refined='{text}' reason=user_moved_on"
                             )
+                        elif no_overlap and not ibus_preedit:
+                            print(
+                                f"⚠️  [{transcribe_time:.2f}s] Rejected refinement (no overlap): '{streaming_text}' -> '{text}'"
+                            )
+                            self._log(
+                                f"refinement_rejected streaming='{streaming_text}' refined='{text}' reason=no_overlap"
+                            )
+                        elif ibus_preedit:
+                            # IBus: clear preedit and commit refined text atomically
+                            prefix = self._pending_refinement_prefix
+                            self._pending_refinement_text = None
+                            self._pending_refinement_prefix = ""
+                            self.ibus_client.send_preedit("")
+                            self.ibus_client.send_commit(prefix + text)
+                            print(
+                                f"🔄 [{transcribe_time:.2f}s] Refined: '{streaming_text}' -> '{text}'"
+                            )
+                            self._log(
+                                f"refinement_correction streaming='{streaming_text}' refined='{text}'"
+                            )
                         else:
-                            # Use LCP diff to minimize backspacing
+                            # Evdev fallback: LCP diff with backspace correction
                             s_lower = streaming_text.lower()
                             t_lower = text.lower()
                             common_len = 0
@@ -1597,29 +1650,19 @@ class VoiceTyping:
                             new_suffix = text[common_len:]
 
                             max_replace = 100
-                            # Only reject if refined text has almost no word overlap
-                            # (protects against hallucination, but allows start-trimming)
-                            stream_words = set(streaming_text.lower().split())
-                            refined_words = set(text.lower().split())
-                            word_overlap = len(stream_words & refined_words)
-                            no_overlap = (
-                                common_len == 0
-                                and word_overlap <= 1
-                                and len(text) < len(streaming_text)
-                            )
-                            if no_overlap:
-                                print(
-                                    f"⚠️  [{transcribe_time:.2f}s] Rejected refinement (no overlap): '{streaming_text}' -> '{text}'"
-                                )
-                                self._log(
-                                    f"refinement_rejected streaming='{streaming_text}' refined='{text}' reason=no_overlap"
-                                )
-                            elif chars_to_delete > max_replace:
+                            if chars_to_delete > max_replace:
                                 print(
                                     f"⚠️  [{transcribe_time:.2f}s] Skipped refinement (replace={chars_to_delete}>{max_replace}): '{streaming_text}' -> '{text}'"
                                 )
                                 self._log(
                                     f"refinement_skipped streaming='{streaming_text}' refined='{text}' reason=replace_too_large chars={chars_to_delete}"
+                                )
+                            elif no_overlap:
+                                print(
+                                    f"⚠️  [{transcribe_time:.2f}s] Rejected refinement (no overlap): '{streaming_text}' -> '{text}'"
+                                )
+                                self._log(
+                                    f"refinement_rejected streaming='{streaming_text}' refined='{text}' reason=no_overlap"
                                 )
                             else:
                                 print(
@@ -1629,11 +1672,7 @@ class VoiceTyping:
                                     f"refinement_correction streaming='{streaming_text}' refined='{text}' bs={chars_to_delete}"
                                 )
                                 if chars_to_delete > 0 or new_suffix:
-                                    if self.ibus_client.is_available:
-                                        self.ibus_client.send_replace(
-                                            chars_to_delete, new_suffix
-                                        )
-                                    elif self.key_injector:
+                                    if self.key_injector:
                                         self.key_injector.replace_text(
                                             chars_to_delete, new_suffix
                                         )
@@ -1820,13 +1859,24 @@ class VoiceTyping:
                     self.current_streaming_text = ""
 
                 if streamed:
-                    # IBus: commit preedit as final text (clears underline)
-                    if self.ibus_client.is_available:
-                        self.ibus_client.send_commit(streamed.lstrip())
-
-                    # Strip leading space before sending to refinement
-                    # (turbo won't produce a leading space, so comparison must be fair)
                     refinement_text = streamed.lstrip()
+                    # Preserve leading space for inter-utterance spacing
+                    space_prefix = streamed[: len(streamed) - len(refinement_text)]
+
+                    if (
+                        self.ibus_client.is_available
+                        and self.refinement_enabled
+                        and refinement_text
+                    ):
+                        # IBus + refinement: keep text as preedit until refinement commits.
+                        # This avoids delete_surrounding_text which many apps don't support.
+                        self._pending_refinement_text = refinement_text
+                        self._pending_refinement_prefix = space_prefix
+                    elif self.ibus_client.is_available:
+                        # IBus without refinement: commit immediately
+                        self.ibus_client.send_commit(space_prefix + refinement_text)
+
+                    # Queue for refinement
                     if self.refinement_enabled and refinement_text:
                         audio_copy = streaming_audio_buffer.copy()
                         self._enqueue_transcription(
@@ -1888,6 +1938,13 @@ class VoiceTyping:
 
             if not new_partial or new_partial == old_text:
                 return
+
+            # If refinement is still pending from previous utterance, commit it now
+            if self._pending_refinement_text and self.ibus_client.is_available:
+                prefix = self._pending_refinement_prefix
+                self.ibus_client.send_commit(prefix + self._pending_refinement_text)
+                self._pending_refinement_text = None
+                self._pending_refinement_prefix = ""
 
             # IBus path: atomic preedit update (no LCP diff needed)
             if self.ibus_client.is_available and self.ibus_client.send_preedit(

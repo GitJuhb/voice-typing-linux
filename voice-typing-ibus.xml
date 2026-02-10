@@ -2,7 +2,7 @@
 <component>
     <name>org.freedesktop.IBus.VoiceTyping</name>
     <description>Voice Typing Input Method</description>
-    <exec>ibus-engine-voice-typing</exec>
+    <exec>/home/jordan/voice-typing-nix/ibus-engine-voice-typing</exec>
     <version>1.0</version>
     <author>Voice Typing</author>
     <license>MIT</license>
