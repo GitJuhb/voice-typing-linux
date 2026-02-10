@@ -1,23 +1,31 @@
 #!/usr/bin/env bash
-# Voice typing launcher — auto-detects terminal vs GUI, uses evdev key injection
+# Voice typing launcher — starts IBus engine + streaming STT pipeline
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+IBUS_PID=""
 
-# Default: large-v3 with CUDA for best accuracy
+cleanup() {
+    if [ -n "$IBUS_PID" ] && kill -0 "$IBUS_PID" 2>/dev/null; then
+        kill "$IBUS_PID" 2>/dev/null
+        wait "$IBUS_PID" 2>/dev/null
+    fi
+}
+trap cleanup EXIT INT TERM
+
+# Default: streaming with large-v3-turbo on CUDA
 DEFAULT_ARGS=""
 if [ $# -eq 0 ]; then
-    DEFAULT_ARGS="--model large-v3 --device cuda"
-    echo "Using large-v3 on CUDA (best accuracy)"
-    echo "Options: tiny, base, small, medium, large-v3, distil-large-v3, large-v3-turbo"
-    echo "Add --streaming for real-time onnx mode (partial words as you speak)"
+    DEFAULT_ARGS="--streaming --model large-v3-turbo --device cuda --refinement"
 fi
+
+# Start IBus engine in background
+nix-shell "$SCRIPT_DIR/shell.nix" --run "python -u \"$SCRIPT_DIR/ibus_voice_engine.py\"" &
+IBUS_PID=$!
+sleep 1  # Give IBus engine time to register
 
 # Check session type
 if [ "$XDG_SESSION_TYPE" = "wayland" ]; then
-    echo "Wayland detected — using evdev/uinput key injection"
-    echo "Bind F12 to ./voice-toggle for pause/resume"
-elif [ "$XDG_SESSION_TYPE" = "x11" ]; then
-    echo "X11 detected — using xdotool"
+    echo "Bind F12 to ./voice-toggle for pause/resume on Wayland"
 fi
 
 exec nix-shell "$SCRIPT_DIR/shell.nix" --run "python -u \"$SCRIPT_DIR/enhanced-voice-typing.py\" $DEFAULT_ARGS $*"
