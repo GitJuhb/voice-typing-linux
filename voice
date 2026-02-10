@@ -18,10 +18,28 @@ if [ $# -eq 0 ]; then
     DEFAULT_ARGS="--streaming --model large-v3-turbo --device cuda --refinement"
 fi
 
+# Kill any stale IBus engine instances
+pkill -f "ibus_voice_engine.py" 2>/dev/null
+sleep 0.3
+
 # Start IBus engine in background
 nix-shell "$SCRIPT_DIR/shell.nix" --run "python -u \"$SCRIPT_DIR/ibus_voice_engine.py\"" &
 IBUS_PID=$!
-sleep 1  # Give IBus engine time to register
+
+# Wait for IBus engine to register (it calls bus.register_component on startup)
+echo "Starting IBus voice typing engine..."
+for i in $(seq 1 20); do
+    if ibus engine voice-typing 2>/dev/null; then
+        echo "IBus voice-typing engine active"
+        # Add to GNOME input sources if not already there
+        SOURCES=$(gsettings get org.gnome.desktop.input-sources sources 2>/dev/null)
+        if [[ "$SOURCES" != *"voice-typing"* ]]; then
+            gsettings set org.gnome.desktop.input-sources sources "[('ibus', 'voice-typing'), ('xkb', 'us')]" 2>/dev/null
+        fi
+        break
+    fi
+    sleep 0.5
+done
 
 # Check session type
 if [ "$XDG_SESSION_TYPE" = "wayland" ]; then
