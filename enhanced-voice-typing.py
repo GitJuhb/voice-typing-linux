@@ -206,10 +206,43 @@ class FastKeyInjector:
                 time.sleep(0.0003)  # 0.3ms between batches
 
     def type_text(self, text):
-        """Type a string by emitting key events for each character.
+        """Type a string by emitting key events, batched for terminal compatibility.
 
-        All events are written in a single write() syscall for sub-frame speed.
+        Characters are sent in groups of 20 with 0.3ms sleep between batches.
+        This prevents overwhelming terminal input loops while still completing
+        a 400-char string in ~6ms (well under one 16ms display frame).
         Characters not in the keymap are silently skipped.
+        """
+        if not text:
+            return
+        batch_size = 20
+        i = 0
+        while i < len(text):
+            buf = bytearray()
+            batch_end = min(i + batch_size, len(text))
+            for ch in text[i:batch_end]:
+                mapping = self._CHAR_TO_KEY.get(ch)
+                if mapping is None:
+                    continue
+                keycode, shift = mapping
+                if shift:
+                    buf.extend(self._build_key_events(self.KEY_LSHIFT, True))
+                buf.extend(self._build_key_events(keycode, True))
+                buf.extend(self._build_key_events(keycode, False))
+                if shift:
+                    buf.extend(self._build_key_events(self.KEY_LSHIFT, False))
+            if buf:
+                os.write(self.ui.fd, bytes(buf))
+            i = batch_end
+            if i < len(text):
+                time.sleep(0.0003)  # 0.3ms between batches
+
+    def type_text_burst(self, text):
+        """Type a string in a single write() syscall for sub-frame atomic speed.
+
+        All key events are packed into one kernel call. Works perfectly in GUI
+        apps (browsers, editors) but can overwhelm terminal input loops.
+        Use type_text() for terminal-safe batched typing instead.
         """
         if not text:
             return
@@ -607,6 +640,8 @@ class VoiceTyping:
         )
         self.dropped_transcriptions = 0
         self.last_audio_status_log = 0.0
+        self.last_callback_time = time.time()
+        self._stream_reset_needed = False
         self.last_vad_update = 0.0
 
         # Initialize components
@@ -667,6 +702,10 @@ class VoiceTyping:
         self.pending_command = None
         self.ptt_active = False
         self.ptt_listener = None
+
+        # Focused window detection cache
+        self._last_focus_check = 0.0
+        self._last_focus_terminal = False
         self.last_status_log = 0.0
 
         # Audio visualizer
@@ -1213,6 +1252,8 @@ class VoiceTyping:
         if not self.running:
             return (None, pyaudio.paComplete)
 
+        self.last_callback_time = time.time()
+
         # Skip all processing when paused
         if self.is_paused:
             return (None, pyaudio.paContinue)
@@ -1327,7 +1368,7 @@ class VoiceTyping:
         """Background thread for Whisper transcription (also serves as refinement in streaming mode)"""
         while self.running:
             try:
-                queue_item = self.transcription_queue.get(timeout=0.1)
+                queue_item = self.transcription_queue.get(timeout=0.5)
                 if self.streaming_enabled and isinstance(queue_item, tuple):
                     audio_buffer, streaming_text = queue_item
                     self._process_audio(audio_buffer, streaming_text=streaming_text)
@@ -1340,6 +1381,13 @@ class VoiceTyping:
                     print(f"⚠️ Dropped {dropped} segment(s) due to backlog")
                 self.transcription_queue.task_done()
             except queue.Empty:
+                # Watchdog: if audio callback hasn't fired in 3s, flag stream for reset
+                if not self.is_paused and time.time() - self.last_callback_time > 3.0:
+                    print(
+                        "⚠️  Audio stream stale (no callbacks for 3s), flagging reset..."
+                    )
+                    self._stream_reset_needed = True
+                    self.last_callback_time = time.time()  # prevent repeated flags
                 continue
             except Exception as e:
                 print(f"❌ Transcription worker error: {e}")
@@ -1521,6 +1569,13 @@ class VoiceTyping:
                 )
 
                 self.previous_text = (self.previous_text + " " + text)[-500:]
+
+                # Flag audio stream for reset after long transcriptions.
+                # PyAudio's internal ring buffer can overflow during long Whisper runs,
+                # leaving the stream unable to deliver new audio callbacks.
+                # The main loop handles the actual restart (thread-safe).
+                if transcribe_time > 0.5 and not self.streaming_enabled:
+                    self._stream_reset_needed = True
 
                 # In refinement mode, text is already typed by streaming - skip unless corrected
                 if is_refinement:
@@ -1793,13 +1848,73 @@ class VoiceTyping:
         except Exception as e:
             print(f"Backspace error: {e}")
 
+    def _is_terminal_focused(self):
+        """Check if the focused window is a terminal emulator (cached 500ms)."""
+        now = time.time()
+        if now - self._last_focus_check < 0.5:
+            return self._last_focus_terminal
+
+        self._last_focus_check = now
+        terminals = {
+            "ghostty",
+            "kitty",
+            "alacritty",
+            "foot",
+            "gnome-terminal",
+            "gnome-terminal-server",
+            "konsole",
+            "xterm",
+            "urxvt",
+            "st",
+            "wezterm",
+            "tilix",
+            "terminator",
+            "xfce4-terminal",
+            "sakura",
+        }
+        try:
+            if self.display_server == "wayland":
+                result = subprocess.run(
+                    [
+                        "gdbus",
+                        "call",
+                        "--session",
+                        "--dest",
+                        "org.gnome.Shell",
+                        "--object-path",
+                        "/org/gnome/Shell",
+                        "--method",
+                        "org.gnome.Shell.Eval",
+                        "global.display.focus_window?.get_wm_class()",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=0.5,
+                )
+                wm_class = result.stdout.strip().lower()
+            else:
+                result = subprocess.run(
+                    ["xdotool", "getactivewindow", "getwindowclassname"],
+                    capture_output=True,
+                    text=True,
+                    timeout=0.5,
+                )
+                wm_class = result.stdout.strip().lower()
+            self._last_focus_terminal = any(t in wm_class for t in terminals)
+        except Exception:
+            self._last_focus_terminal = False
+        return self._last_focus_terminal
+
     def _type_raw(self, text: str):
         """Type text without adding to typing history (for streaming partials)."""
         if not text:
             return
         try:
             if self.key_injector:
-                self.key_injector.type_text(text)
+                if self._is_terminal_focused():
+                    self.key_injector.type_text(text)
+                else:
+                    self.key_injector.type_text_burst(text)
             elif self.display_server == "wayland":
                 subprocess.run(
                     ["ydotool", "type", "-d", "0", "-H", "0", "--", text],
@@ -1994,13 +2109,22 @@ class VoiceTyping:
 
             # Keep main thread alive
             while self.running:
-                if self.stream and not self.stream.is_active():
+                try:
+                    stream_active = self.stream and self.stream.is_active()
+                except Exception:
+                    stream_active = False
+                # Reset stream if flagged by worker or if stream died
+                needs_reset = self._stream_reset_needed or not stream_active
+                if needs_reset:
                     now = time.time()
                     if now - self.last_stream_restart > 1.0:
                         self.last_stream_restart = now
-                        print("⚠️  Audio stream stopped, restarting...")
+                        reason = "flagged" if self._stream_reset_needed else "stopped"
+                        self._stream_reset_needed = False
+                        print(f"🔄 Audio stream reset ({reason})")
                         try:
                             self._restart_audio_stream()
+                            self.last_callback_time = time.time()
                         except Exception as e:
                             print(f"⚠️  Audio stream restart failed: {e}")
                 if (
