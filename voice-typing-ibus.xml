@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<component>
+    <name>org.freedesktop.IBus.VoiceTyping</name>
+    <description>Voice Typing Input Method</description>
+    <exec>ibus-engine-voice-typing</exec>
+    <version>1.0</version>
+    <author>Voice Typing</author>
+    <license>MIT</license>
+    <homepage></homepage>
+    <textdomain>voice-typing</textdomain>
+    <engines>
+        <engine>
+            <name>voice-typing</name>
+            <longname>Voice Typing</longname>
+            <description>Voice-to-text input via streaming STT</description>
+            <language>en</language>
+            <license>MIT</license>
+            <author>Voice Typing</author>
+            <icon>audio-input-microphone</icon>
+            <layout>us</layout>
+            <rank>0</rank>
+        </engine>
+    </engines>
+</component>

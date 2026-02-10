@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Launcher for the IBus voice typing engine.
+# IBus calls this via the <exec> path in voice-typing-ibus.xml.
+# Activates the nix-shell environment then runs the engine.
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+exec nix-shell "$SCRIPT_DIR/shell.nix" --run "python '$SCRIPT_DIR/ibus_voice_engine.py'"

@@ -35,6 +35,9 @@ pkgs.mkShell {
     python311Packages.pygobject3
     python311Packages.pycairo
 
+    # IBus input method framework (atomic text insertion)
+    ibus
+
     # Streaming STT (sherpa-onnx uses onnxruntime)
     onnxruntime
 
@@ -61,7 +64,7 @@ pkgs.mkShell {
     export LD_PRELOAD="${pkgs.gtk4-layer-shell}/lib/libgtk4-layer-shell.so''${LD_PRELOAD:+:$LD_PRELOAD}"
 
     # GTK4 layer-shell typelib path
-    export GI_TYPELIB_PATH="${pkgs.gtk4}/lib/girepository-1.0:${pkgs.gtk4-layer-shell}/lib/girepository-1.0:${pkgs.glib.out}/lib/girepository-1.0:$GI_TYPELIB_PATH"
+    export GI_TYPELIB_PATH="${pkgs.ibus}/lib/girepository-1.0:${pkgs.gtk4}/lib/girepository-1.0:${pkgs.gtk4-layer-shell}/lib/girepository-1.0:${pkgs.glib.out}/lib/girepository-1.0:$GI_TYPELIB_PATH"
     
     # Create virtual environment if it doesn't exist
     if [ ! -d .venv ]; then

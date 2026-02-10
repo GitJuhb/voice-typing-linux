@@ -294,6 +294,84 @@ class FastKeyInjector:
             pass
 
 
+class IBusClient:
+    """Client for communicating with the IBus voice typing engine.
+
+    Maintains a persistent Unix socket connection. Commands are newline-terminated:
+      preedit:TEXT     - streaming partial (shown as underlined preedit)
+      commit:TEXT      - atomic text insertion (clears preedit first)
+      delete:N         - delete N chars before cursor
+      replace:N:TEXT   - delete N chars then commit TEXT
+    """
+
+    SOCKET_PATH = os.path.join(
+        os.environ.get("XDG_RUNTIME_DIR", "/tmp"),
+        f"voice-typing-ibus-{os.getuid()}.sock",
+    )
+
+    def __init__(self):
+        self._sock = None
+        self._lock = threading.Lock()
+
+    @property
+    def is_available(self):
+        """Check if IBus engine socket exists."""
+        return os.path.exists(self.SOCKET_PATH)
+
+    def _ensure_connected(self):
+        if self._sock is not None:
+            return True
+        if not os.path.exists(self.SOCKET_PATH):
+            return False
+        try:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.connect(self.SOCKET_PATH)
+            self._sock = sock
+            return True
+        except (ConnectionError, OSError):
+            self._sock = None
+            return False
+
+    def _send(self, message):
+        with self._lock:
+            if not self._ensure_connected():
+                return False
+            try:
+                self._sock.sendall((message + "\n").encode("utf-8"))
+                return True
+            except (BrokenPipeError, ConnectionError, OSError):
+                self._sock = None
+                if not self._ensure_connected():
+                    return False
+                try:
+                    self._sock.sendall((message + "\n").encode("utf-8"))
+                    return True
+                except (BrokenPipeError, ConnectionError, OSError):
+                    self._sock = None
+                    return False
+
+    def send_preedit(self, text):
+        return self._send(f"preedit:{text}")
+
+    def send_commit(self, text):
+        return self._send(f"commit:{text}")
+
+    def send_delete(self, count):
+        return self._send(f"delete:{count}")
+
+    def send_replace(self, count, text):
+        return self._send(f"replace:{count}:{text}")
+
+    def close(self):
+        with self._lock:
+            if self._sock:
+                try:
+                    self._sock.close()
+                except Exception:
+                    pass
+                self._sock = None
+
+
 # Hotkey name to pynput format mapping
 HOTKEY_MAP = {
     "f12": "<f12>",
@@ -589,6 +667,13 @@ class VoiceTyping:
         self.display_server = detect_display_server()
         print(f"🖥️  Display server: {self.display_server.upper()}")
 
+        # IBus client for atomic text insertion (preferred over key injection)
+        self.ibus_client = IBusClient()
+        if self.ibus_client.is_available:
+            print("✅ IBus engine available (atomic text insertion)")
+        else:
+            print("ℹ️  IBus engine not running (using key injection fallback)")
+
         # Initialize key injection backend
         self.key_injector = None
         if self.display_server == "wayland":
@@ -703,9 +788,6 @@ class VoiceTyping:
         self.ptt_active = False
         self.ptt_listener = None
 
-        # Focused window detection cache
-        self._last_focus_check = 0.0
-        self._last_focus_terminal = False
         self.last_status_log = 0.0
 
         # Audio visualizer
@@ -1546,9 +1628,12 @@ class VoiceTyping:
                                 self._log(
                                     f"refinement_correction streaming='{streaming_text}' refined='{text}' bs={chars_to_delete}"
                                 )
-                                # Single syscall: backspace + retype in one write()
                                 if chars_to_delete > 0 or new_suffix:
-                                    if self.key_injector:
+                                    if self.ibus_client.is_available:
+                                        self.ibus_client.send_replace(
+                                            chars_to_delete, new_suffix
+                                        )
+                                    elif self.key_injector:
                                         self.key_injector.replace_text(
                                             chars_to_delete, new_suffix
                                         )
@@ -1735,6 +1820,10 @@ class VoiceTyping:
                     self.current_streaming_text = ""
 
                 if streamed:
+                    # IBus: commit preedit as final text (clears underline)
+                    if self.ibus_client.is_available:
+                        self.ibus_client.send_commit(streamed.lstrip())
+
                     # Strip leading space before sending to refinement
                     # (turbo won't produce a leading space, so comparison must be fair)
                     refinement_text = streamed.lstrip()
@@ -1788,25 +1877,26 @@ class VoiceTyping:
                 self.streaming_stt.reset()
 
     def _type_streaming_partial(self, new_partial: str):
-        """Incrementally type streaming partial results with backspace correction.
+        """Incrementally type streaming partial results.
 
-        Lowercases sherpa-onnx output (which is ALL CAPS) for readability.
-        Finds the longest common prefix between what's currently on screen
-        and the new partial, backspaces the divergent tail, and types new text.
+        With IBus: updates preedit text atomically (no backspace needed).
+        Without IBus: uses LCP diff with backspace correction via evdev.
         """
         with self.streaming_lock:
-            # Lowercase sherpa-onnx output (refinement will fix casing later)
             new_partial = new_partial.lower()
-
             old_text = self.current_streaming_text
 
-            if not new_partial:
+            if not new_partial or new_partial == old_text:
                 return
 
-            if new_partial == old_text:
-                return  # No change
+            # IBus path: atomic preedit update (no LCP diff needed)
+            if self.ibus_client.is_available and self.ibus_client.send_preedit(
+                new_partial
+            ):
+                self.current_streaming_text = new_partial
+                return
 
-            # Find longest common prefix
+            # Evdev fallback: LCP diff with backspace correction
             common_len = 0
             for i in range(min(len(old_text), len(new_partial))):
                 if old_text[i] == new_partial[i]:
@@ -1814,9 +1904,7 @@ class VoiceTyping:
                 else:
                     break
 
-            # Backspace the divergent tail of old text
             chars_to_delete = len(old_text) - common_len
-            # New characters to type
             new_chars = new_partial[common_len:]
 
             if chars_to_delete > 0:
@@ -1832,6 +1920,8 @@ class VoiceTyping:
         if count <= 0:
             return
         try:
+            if self.ibus_client.is_available and self.ibus_client.send_delete(count):
+                return
             if self.key_injector:
                 self.key_injector.send_backspaces(count)
             elif self.display_server == "wayland":
@@ -1848,73 +1938,15 @@ class VoiceTyping:
         except Exception as e:
             print(f"Backspace error: {e}")
 
-    def _is_terminal_focused(self):
-        """Check if the focused window is a terminal emulator (cached 500ms)."""
-        now = time.time()
-        if now - self._last_focus_check < 0.5:
-            return self._last_focus_terminal
-
-        self._last_focus_check = now
-        terminals = {
-            "ghostty",
-            "kitty",
-            "alacritty",
-            "foot",
-            "gnome-terminal",
-            "gnome-terminal-server",
-            "konsole",
-            "xterm",
-            "urxvt",
-            "st",
-            "wezterm",
-            "tilix",
-            "terminator",
-            "xfce4-terminal",
-            "sakura",
-        }
-        try:
-            if self.display_server == "wayland":
-                result = subprocess.run(
-                    [
-                        "gdbus",
-                        "call",
-                        "--session",
-                        "--dest",
-                        "org.gnome.Shell",
-                        "--object-path",
-                        "/org/gnome/Shell",
-                        "--method",
-                        "org.gnome.Shell.Eval",
-                        "global.display.focus_window?.get_wm_class()",
-                    ],
-                    capture_output=True,
-                    text=True,
-                    timeout=0.5,
-                )
-                wm_class = result.stdout.strip().lower()
-            else:
-                result = subprocess.run(
-                    ["xdotool", "getactivewindow", "getwindowclassname"],
-                    capture_output=True,
-                    text=True,
-                    timeout=0.5,
-                )
-                wm_class = result.stdout.strip().lower()
-            self._last_focus_terminal = any(t in wm_class for t in terminals)
-        except Exception:
-            self._last_focus_terminal = False
-        return self._last_focus_terminal
-
     def _type_raw(self, text: str):
         """Type text without adding to typing history (for streaming partials)."""
         if not text:
             return
         try:
+            if self.ibus_client.is_available and self.ibus_client.send_commit(text):
+                return
             if self.key_injector:
-                if self._is_terminal_focused():
-                    self.key_injector.type_text(text)
-                else:
-                    self.key_injector.type_text_burst(text)
+                self.key_injector.type_text(text)
             elif self.display_server == "wayland":
                 subprocess.run(
                     ["ydotool", "type", "-d", "0", "-H", "0", "--", text],
@@ -2021,9 +2053,11 @@ class VoiceTyping:
         print(f"🤔 Confirm command '{action}'? Say 'confirm' or 'cancel'.")
 
     def type_text(self, text):
-        """Type text using direct uinput (Wayland), ydotool fallback, or xdotool (X11)"""
+        """Type text using IBus commit (preferred), evdev, ydotool, or xdotool."""
         try:
-            if self.key_injector:
+            if self.ibus_client.is_available and self.ibus_client.send_commit(text):
+                pass
+            elif self.key_injector:
                 self.key_injector.type_text(text)
             elif self.display_server == "wayland":
                 subprocess.run(
@@ -2177,6 +2211,13 @@ class VoiceTyping:
         if os.path.exists(TOKEN_PATH):
             try:
                 os.remove(TOKEN_PATH)
+            except:
+                pass
+
+        # Close IBus client
+        if self.ibus_client:
+            try:
+                self.ibus_client.close()
             except:
                 pass
 
