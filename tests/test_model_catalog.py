@@ -1,6 +1,7 @@
 import importlib.util
 import errno
 import json
+import os
 import pathlib
 import socket
 import sys
@@ -224,6 +225,94 @@ class ParserDefaultTests(unittest.TestCase):
         )
         self.assertTrue(legacy.post_commit_correction)
         self.assertEqual(legacy.correction_model, "parakeet-tdt-0.6b-v2")
+
+    def test_parser_supports_output_backend_and_remote_modes(self):
+        module = load_main_module()
+        parser = module._build_parser(module._build_defaults({}))
+
+        defaults = parser.parse_args([])
+        self.assertEqual(defaults.output_backend, "auto")
+        self.assertEqual(defaults.remote_mode, "auto")
+
+        explicit = parser.parse_args(
+            ["--output-backend", "clipboard-paste", "--remote-mode", "live-keys"]
+        )
+        self.assertEqual(explicit.output_backend, "clipboard-paste")
+        self.assertEqual(explicit.remote_mode, "live-keys")
+
+        shortcut = parser.parse_args(["--remote-live-keys"])
+        self.assertEqual(shortcut.remote_mode, "live-keys")
+
+        disabled = parser.parse_args(["--no-remote-auto"])
+        self.assertEqual(disabled.remote_mode, "off")
+
+    def test_env_overrides_output_backend_and_remote_mode(self):
+        module = load_main_module()
+        with mock.patch.dict(
+            os.environ,
+            {
+                "VOICE_OUTPUT_BACKEND": "keys",
+                "VOICE_REMOTE_MODE": "live-keys",
+            },
+        ):
+            config = module._apply_env_overrides({})
+        self.assertEqual(config["output_backend"], "keys")
+        self.assertEqual(config["remote_mode"], "live-keys")
+
+
+class RemoteDesktopOutputTests(unittest.TestCase):
+    def test_remote_window_identity_matches_known_clients(self):
+        module = load_main_module()
+        self.assertTrue(
+            module.VoiceTyping._is_remote_window_identity("class=RustDesk")
+        )
+        self.assertTrue(
+            module.VoiceTyping._is_remote_window_identity("Remmina remote desktop")
+        )
+        self.assertTrue(
+            module.VoiceTyping._is_remote_window_identity("xfreerdp /v:server")
+        )
+        self.assertFalse(module.VoiceTyping._is_remote_window_identity("Firefox"))
+
+    def test_auto_backend_uses_clipboard_paste_for_remote_focus(self):
+        module = load_main_module()
+        vt = module.VoiceTyping.__new__(module.VoiceTyping)
+        vt.output_backend = "auto"
+        vt.remote_mode = "auto"
+        with mock.patch.object(vt, "_focused_remote_desktop", return_value=True):
+            self.assertEqual(vt._effective_output_backend(), "clipboard-paste")
+            self.assertTrue(vt._defer_streaming_partials())
+
+    def test_auto_backend_can_use_live_keys_for_remote_focus(self):
+        module = load_main_module()
+        vt = module.VoiceTyping.__new__(module.VoiceTyping)
+        vt.output_backend = "auto"
+        vt.remote_mode = "live-keys"
+        with mock.patch.object(vt, "_focused_remote_desktop", return_value=True):
+            self.assertEqual(vt._effective_output_backend(), "keys")
+            self.assertFalse(vt._defer_streaming_partials())
+
+    def test_auto_backend_uses_ibus_for_local_or_disabled_remote(self):
+        module = load_main_module()
+        vt = module.VoiceTyping.__new__(module.VoiceTyping)
+        vt.output_backend = "auto"
+        vt.remote_mode = "off"
+        with mock.patch.object(vt, "_focused_remote_desktop", return_value=True):
+            self.assertEqual(vt._effective_output_backend(), "ibus")
+
+        vt.remote_mode = "auto"
+        with mock.patch.object(vt, "_focused_remote_desktop", return_value=False):
+            self.assertEqual(vt._effective_output_backend(), "ibus")
+
+    def test_forced_output_backends_bypass_remote_detection(self):
+        module = load_main_module()
+        vt = module.VoiceTyping.__new__(module.VoiceTyping)
+        vt.remote_mode = "auto"
+        for backend in ("ibus", "keys", "clipboard-paste"):
+            vt.output_backend = backend
+            with mock.patch.object(vt, "_focused_remote_desktop") as focused:
+                self.assertEqual(vt._effective_output_backend(), backend)
+                focused.assert_not_called()
 
 
 class IBusClientTests(unittest.TestCase):

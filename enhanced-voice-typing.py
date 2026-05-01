@@ -29,6 +29,7 @@ import re
 import secrets
 import json
 import logging
+import shutil
 from logging.handlers import RotatingFileHandler
 
 try:
@@ -338,6 +339,15 @@ class FastKeyInjector:
         if buf:
             os.write(self.ui.fd, bytes(buf))
 
+    def send_ctrl_v(self):
+        """Send Ctrl+V for clipboard paste."""
+        buf = bytearray()
+        buf.extend(self._build_key_events(self.KEY_LCTRL, True))
+        buf.extend(self._build_key_events(self.KEY_V, True))
+        buf.extend(self._build_key_events(self.KEY_V, False))
+        buf.extend(self._build_key_events(self.KEY_LCTRL, False))
+        os.write(self.ui.fd, bytes(buf))
+
     def close(self):
         """Release the uinput device."""
         try:
@@ -450,6 +460,22 @@ HOTKEY_MAP = {
     "pause": "<pause>",
 }
 
+OUTPUT_BACKENDS = ["auto", "ibus", "keys", "clipboard-paste"]
+REMOTE_MODES = ["auto", "endpoint-paste", "live-keys", "off"]
+REMOTE_WINDOW_PATTERNS = (
+    "rustdesk",
+    "remmina",
+    "xfreerdp",
+    "wlfreerdp",
+    "freerdp",
+    "krdc",
+    "microsoft remote desktop",
+    "remote desktop",
+    "virt-viewer",
+    "virt viewer",
+    "spice-gtk",
+)
+
 # Socket for Wayland fallback (per-user, permissioned)
 RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR", "/tmp")
 SOCKET_PATH = os.path.join(RUNTIME_DIR, f"voice-typing-{os.getuid()}.sock")
@@ -502,6 +528,8 @@ CONFIG_DEFAULTS = {
     "streaming_model": "nemotron-asr-streaming-nim",
     "post_commit_correction": False,
     "correction_model": "parakeet-tdt-0.6b-v2",
+    "output_backend": "auto",
+    "remote_mode": "auto",
 }
 
 
@@ -579,6 +607,8 @@ def _apply_env_overrides(config: dict) -> dict:
         "streaming_model": "VOICE_STREAMING_MODEL",
         "post_commit_correction": "VOICE_POST_COMMIT_CORRECTION",
         "correction_model": "VOICE_CORRECTION_MODEL",
+        "output_backend": "VOICE_OUTPUT_BACKEND",
+        "remote_mode": "VOICE_REMOTE_MODE",
     }
 
     legacy_mapping = {
@@ -721,6 +751,8 @@ class VoiceTyping:
         streaming_model="nemotron-asr-streaming-nim",
         post_commit_correction_enabled=False,
         correction_model="parakeet-tdt-0.6b-v2",
+        output_backend="auto",
+        remote_mode="auto",
     ):
         self.model_size = model_size
         self.device = device
@@ -744,6 +776,17 @@ class VoiceTyping:
         # Detect display server (Wayland vs X11)
         self.display_server = detect_display_server()
         print(f"🖥️  Display server: {self.display_server.upper()}")
+
+        self.output_backend = output_backend
+        self.remote_mode = remote_mode
+        self._remote_focus_cache = (0.0, False, "")
+        self._last_remote_focus_active = None
+        self.clipboard_paste_settle_seconds = 0.12
+        self.clipboard_restore_delay_seconds = 0.75
+        print(
+            f"⌨️  Output backend: {self.output_backend} "
+            f"(remote mode: {self.remote_mode})"
+        )
 
         # IBus client for atomic text insertion (preferred over key injection)
         self.ibus_client = IBusClient()
@@ -2120,6 +2163,7 @@ class VoiceTyping:
         replacements are allowed to avoid long visible stalls when the
         recognizer revises earlier words.
         """
+        defer_partials = self._defer_streaming_partials()
         with self.streaming_lock:
             new_partial = new_partial.lower()
             old_text = self.current_streaming_text
@@ -2128,6 +2172,9 @@ class VoiceTyping:
                 return
 
             self.current_streaming_text = new_partial
+
+            if defer_partials:
+                return
 
             # IBus path: atomic preedit update (no LCP diff needed)
             if self._streaming_preedit_enabled() and self.ibus_client.send_preedit(
@@ -2205,20 +2252,28 @@ class VoiceTyping:
         committed_text = streamed
         visible_text = self.visible_streaming_text
         self.visible_streaming_text = ""
+        output_backend = self._effective_output_backend()
 
         if self._streaming_preedit_enabled():
             self.ibus_client.send_preedit("")
         if visible_text:
             self._replace_typed_text(visible_text, committed_text)
-        elif self.ibus_client.is_available:
-            if not self.ibus_client.send_commit(committed_text):
-                self._type_raw(committed_text)
-        else:
+        elif output_backend == "ibus":
             self._type_raw(committed_text)
+        else:
+            self._type_raw(committed_text, backend=output_backend)
 
-        if self.refinement_enabled and refinement_text:
+        if (
+            self.refinement_enabled
+            and refinement_text
+            and output_backend != "clipboard-paste"
+        ):
             audio_copy = streaming_audio_buffer.copy()
             self._enqueue_transcription(audio_copy, streaming_text=refinement_text)
+        elif self.refinement_enabled and refinement_text:
+            self._log(
+                "post_commit_correction_skipped reason=clipboard_paste_remote_mode"
+            )
 
         self._log(f"{log_event} text='{streamed}' chunks={len(streaming_audio_buffer)}")
 
@@ -2229,46 +2284,264 @@ class VoiceTyping:
         if not self.refinement_enabled:
             self.previous_text = (self.previous_text + " " + streamed)[-500:]
 
+    @staticmethod
+    def _is_remote_window_identity(identity: str) -> bool:
+        """Return True if a focused-window identity looks like a remote desktop."""
+        normalized = (identity or "").lower()
+        return any(pattern in normalized for pattern in REMOTE_WINDOW_PATTERNS)
+
+    def _focused_window_identity(self) -> str:
+        """Best-effort focused window class/title for remote-output routing."""
+        parts = []
+
+        def run_text(command, timeout=0.35):
+            try:
+                result = subprocess.run(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                    check=False,
+                )
+            except Exception:
+                return ""
+            if result.returncode != 0:
+                return ""
+            return (result.stdout or "").strip()
+
+        # Hyprland exposes active-window metadata directly on Wayland.
+        if shutil.which("hyprctl"):
+            output = run_text(["hyprctl", "activewindow", "-j"])
+            if output:
+                try:
+                    data = json.loads(output)
+                    for key in ("class", "initialClass", "title", "initialTitle"):
+                        value = data.get(key)
+                        if value:
+                            parts.append(str(value))
+                except Exception:
+                    pass
+
+        # Sway/i3-compatible Wayland compositors expose the focused node tree.
+        if shutil.which("swaymsg"):
+            output = run_text(["swaymsg", "-t", "get_tree"], timeout=0.6)
+            if output:
+                try:
+                    tree = json.loads(output)
+
+                    def find_focused(node):
+                        if node.get("focused"):
+                            return node
+                        for child in node.get("nodes", []) + node.get("floating_nodes", []):
+                            found = find_focused(child)
+                            if found:
+                                return found
+                        return None
+
+                    focused = find_focused(tree)
+                    if focused:
+                        for key in ("app_id", "window_class", "name"):
+                            value = focused.get(key)
+                            if value:
+                                parts.append(str(value))
+                except Exception:
+                    pass
+
+        # X11 and many XWayland remote clients are visible to xdotool.
+        if shutil.which("xdotool"):
+            window_id = run_text(["xdotool", "getwindowfocus"])
+            if window_id:
+                for command in (
+                    ["xdotool", "getwindowclassname", window_id],
+                    ["xdotool", "getwindowname", window_id],
+                ):
+                    value = run_text(command)
+                    if value:
+                        parts.append(value)
+
+        return "\n".join(dict.fromkeys(parts))
+
+    def _focused_remote_desktop(self) -> bool:
+        """Cached remote-desktop focus detection for auto output routing."""
+        now = time.time()
+        cached_at, cached_value, _cached_identity = self._remote_focus_cache
+        if now - cached_at < 0.5:
+            return cached_value
+
+        identity = self._focused_window_identity()
+        active = self._is_remote_window_identity(identity)
+        self._remote_focus_cache = (now, active, identity)
+
+        if active != self._last_remote_focus_active:
+            self._last_remote_focus_active = active
+            if active and self.output_backend == "auto" and self.remote_mode != "off":
+                backend = "keys" if self.remote_mode == "live-keys" else "clipboard-paste"
+                print(f"🖥️  Remote desktop window detected; using {backend}")
+                self._log(f"remote_desktop_detected backend={backend} identity={identity!r}")
+
+        return active
+
+    def _effective_output_backend(self) -> str:
+        """Resolve auto/remote output routing to a concrete backend."""
+        output_backend = getattr(self, "output_backend", "ibus")
+        remote_mode = getattr(self, "remote_mode", "off")
+        if output_backend != "auto":
+            return output_backend
+        if remote_mode != "off" and self._focused_remote_desktop():
+            if remote_mode == "live-keys":
+                return "keys"
+            return "clipboard-paste"
+        return "ibus"
+
+    def _defer_streaming_partials(self) -> bool:
+        """Avoid streaming backspace/retype churn when endpoint paste is active."""
+        return self._effective_output_backend() == "clipboard-paste"
+
+    def _type_text_via_keys(self, text: str):
+        """Type text through key injection only, bypassing IBus."""
+        if self.key_injector:
+            self.key_injector.type_text(text)
+        elif self.display_server == "wayland":
+            subprocess.run(
+                ["ydotool", "type", "-d", "0", "-H", "0", "--", text],
+                check=True,
+                env=self._ydotool_env(),
+            )
+        else:
+            subprocess.run(["xdotool", "type", "--delay", "0", text], check=True)
+
+    def _send_backspaces_via_keys(self, count: int):
+        """Send backspaces through key injection only, bypassing IBus."""
+        if count <= 0:
+            return
+        if self.key_injector:
+            self.key_injector.send_backspaces(count)
+        elif self.display_server == "wayland":
+            env = self._ydotool_env()
+            key_args = []
+            for _ in range(count):
+                key_args.extend(["14:1", "14:0"])
+            subprocess.run(["ydotool", "key"] + key_args, check=True, env=env)
+        else:
+            subprocess.run(
+                ["xdotool", "key", "--repeat", str(count), "BackSpace"],
+                check=True,
+            )
+
+    def _clipboard_read_text(self):
+        """Read the current clipboard when a supported CLI is available."""
+        if shutil.which("wl-paste"):
+            command = ["wl-paste", "--no-newline"]
+        elif shutil.which("xclip"):
+            command = ["xclip", "-selection", "clipboard", "-out"]
+        elif shutil.which("xsel"):
+            command = ["xsel", "--clipboard", "--output"]
+        else:
+            return None
+
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=0.75,
+                check=False,
+            )
+        except Exception:
+            return None
+        if result.returncode != 0:
+            return None
+        return result.stdout
+
+    def _clipboard_set_text(self, text: str):
+        """Set clipboard text through wl-copy/xclip/xsel."""
+        if shutil.which("wl-copy"):
+            command = ["wl-copy"]
+        elif shutil.which("xclip"):
+            command = ["xclip", "-selection", "clipboard"]
+        elif shutil.which("xsel"):
+            command = ["xsel", "--clipboard", "--input"]
+        else:
+            raise RuntimeError(
+                "clipboard backend requires wl-clipboard, xclip, or xsel"
+            )
+
+        subprocess.run(command, input=text, text=True, timeout=2.0, check=True)
+
+    def _restore_clipboard_later(self, previous_text):
+        if previous_text is None:
+            return
+
+        def restore():
+            time.sleep(self.clipboard_restore_delay_seconds)
+            try:
+                self._clipboard_set_text(previous_text)
+            except Exception as e:
+                self._log(f"clipboard_restore_failed error={e}", level="warning")
+
+        thread = threading.Thread(target=restore, daemon=True)
+        thread.start()
+
+    def _send_paste_hotkey(self):
+        """Send Ctrl+V through the active key-injection path."""
+        if self.key_injector:
+            self.key_injector.send_ctrl_v()
+        elif self.display_server == "wayland":
+            subprocess.run(
+                ["ydotool", "key", "29:1", "47:1", "47:0", "29:0"],
+                check=True,
+                env=self._ydotool_env(),
+            )
+        else:
+            subprocess.run(["xdotool", "key", "ctrl+v"], check=True)
+
+    def _paste_text(self, text: str):
+        """Paste text by setting the local clipboard and sending Ctrl+V."""
+        previous_text = self._clipboard_read_text()
+        self._clipboard_set_text(text)
+        time.sleep(self.clipboard_paste_settle_seconds)
+        self._send_paste_hotkey()
+        self._restore_clipboard_later(previous_text)
+
     def _send_backspaces(self, count: int):
         """Send backspace key presses."""
         if count <= 0:
             return
         try:
-            if self.ibus_client.is_available and self.ibus_client.send_delete(count):
+            backend = self._effective_output_backend()
+            if (
+                backend == "ibus"
+                and self.ibus_client.is_available
+                and self.ibus_client.send_delete(count)
+            ):
                 return
-            if self.key_injector:
-                self.key_injector.send_backspaces(count)
-            elif self.display_server == "wayland":
-                env = self._ydotool_env()
-                key_args = []
-                for _ in range(count):
-                    key_args.extend(["14:1", "14:0"])
-                subprocess.run(["ydotool", "key"] + key_args, check=True, env=env)
-            else:
-                subprocess.run(
-                    ["xdotool", "key", "--repeat", str(count), "BackSpace"],
-                    check=True,
-                )
+            self._send_backspaces_via_keys(count)
         except Exception as e:
             print(f"Backspace error: {e}")
 
-    def _type_raw(self, text: str):
+    def _type_raw(self, text: str, backend: str | None = None):
         """Type text without adding to typing history (for streaming partials)."""
         if not text:
             return
+        backend = backend or self._effective_output_backend()
         try:
-            if self.ibus_client.is_available and self.ibus_client.send_commit(text):
+            if backend == "clipboard-paste":
+                try:
+                    self._paste_text(text)
+                    return
+                except Exception as e:
+                    print(f"Clipboard paste error: {e}; falling back to keys")
+                    self._log(f"clipboard_paste_failed error={e}", level="warning")
+                    backend = "keys"
+
+            if (
+                backend == "ibus"
+                and self.ibus_client.is_available
+                and self.ibus_client.send_commit(text)
+            ):
                 return
-            if self.key_injector:
-                self.key_injector.type_text(text)
-            elif self.display_server == "wayland":
-                subprocess.run(
-                    ["ydotool", "type", "-d", "0", "-H", "0", "--", text],
-                    check=True,
-                    env=self._ydotool_env(),
-                )
-            else:
-                subprocess.run(["xdotool", "type", "--delay", "0", text], check=True)
+
+            self._type_text_via_keys(text)
         except Exception as e:
             print(f"Type error: {e}")
 
@@ -2289,17 +2562,34 @@ class VoiceTyping:
 
     def _replace_typed_text(self, old_text: str, new_text: str):
         """Replace previously typed text with new text after an optional correction."""
+        backend = self._effective_output_backend()
         if not old_text:
-            self._type_raw(new_text)
+            self._type_raw(new_text, backend=backend)
             return 0
 
         chars_to_delete, new_suffix = self._compute_replacement(old_text, new_text)
         if chars_to_delete <= 0 and not new_suffix:
             return 0
 
-        if self.ibus_client.is_available and self.ibus_client.supports_surrounding_text:
+        if (
+            backend == "ibus"
+            and self.ibus_client.is_available
+            and self.ibus_client.supports_surrounding_text
+        ):
             if self.ibus_client.send_replace(chars_to_delete, new_suffix):
                 return chars_to_delete
+
+        if backend == "clipboard-paste":
+            if chars_to_delete > 0:
+                self._send_backspaces_via_keys(chars_to_delete)
+            if new_suffix:
+                try:
+                    self._paste_text(new_suffix)
+                except Exception as e:
+                    print(f"Clipboard paste error: {e}; falling back to keys")
+                    self._log(f"clipboard_paste_failed error={e}", level="warning")
+                    self._type_text_via_keys(new_suffix)
+            return chars_to_delete
 
         if self.key_injector:
             # Single write() syscall: backspace + retype in one kernel call
@@ -2309,7 +2599,7 @@ class VoiceTyping:
         if chars_to_delete > 0:
             self._send_backspaces(chars_to_delete)
         if new_suffix:
-            self._type_raw(new_suffix)
+            self._type_raw(new_suffix, backend=backend)
         return chars_to_delete
 
     def _update_last_typed_history(self, old_text: str, new_text: str):
@@ -2404,20 +2694,9 @@ class VoiceTyping:
         print(f"🤔 Confirm command '{action}'? Say 'confirm' or 'cancel'.")
 
     def type_text(self, text):
-        """Type text using IBus commit (preferred), evdev, ydotool, or xdotool."""
+        """Type text using the configured output backend."""
         try:
-            if self.ibus_client.is_available and self.ibus_client.send_commit(text):
-                pass
-            elif self.key_injector:
-                self.key_injector.type_text(text)
-            elif self.display_server == "wayland":
-                subprocess.run(
-                    ["ydotool", "type", "-d", "0", "-H", "0", "--", text],
-                    check=True,
-                    env=self._ydotool_env(),
-                )
-            else:
-                subprocess.run(["xdotool", "type", "--delay", "0", text], check=True)
+            self._type_raw(text)
             print(f"⌨️  Typed: '{text}'")
 
             # Track for scratch that
@@ -2682,6 +2961,34 @@ def _build_parser(defaults: dict) -> argparse.ArgumentParser:
         help="Hotkey for pause/resume (default: f12)",
     )
     parser.add_argument(
+        "--output-backend",
+        default=defaults["output_backend"],
+        choices=OUTPUT_BACKENDS,
+        help="Text output path: auto, ibus, keys, or clipboard-paste",
+    )
+    parser.add_argument(
+        "--remote-mode",
+        default=defaults["remote_mode"],
+        choices=REMOTE_MODES,
+        help="Auto behavior for RustDesk/Remmina/RDP windows: endpoint-paste, live-keys, auto, or off",
+    )
+    parser.add_argument(
+        "--remote-live-keys",
+        dest="remote_mode",
+        action="store_const",
+        const="live-keys",
+        default=argparse.SUPPRESS,
+        help="Shortcut for --remote-mode live-keys",
+    )
+    parser.add_argument(
+        "--no-remote-auto",
+        dest="remote_mode",
+        action="store_const",
+        const="off",
+        default=argparse.SUPPRESS,
+        help="Disable focused remote-desktop auto routing",
+    )
+    parser.add_argument(
         "--commands",
         action=argparse.BooleanOptionalAction,
         default=defaults["commands"],
@@ -2927,13 +3234,15 @@ def main():
     if logger:
         logger.info("starting voice typing")
         logger.info(
-            "config model=%s device=%s commands=%s input_device=%s ptt=%s streaming=%s",
+            "config model=%s device=%s commands=%s input_device=%s ptt=%s streaming=%s output_backend=%s remote_mode=%s",
             args.model,
             args.device,
             args.commands,
             args.input_device,
             args.ptt,
             args.streaming,
+            args.output_backend,
+            args.remote_mode,
         )
 
     # Device selection
@@ -2992,6 +3301,8 @@ def main():
         streaming_model=args.streaming_model,
         post_commit_correction_enabled=args.post_commit_correction,
         correction_model=args.correction_model,
+        output_backend=args.output_backend,
+        remote_mode=args.remote_mode,
     )
 
     # Handle graceful shutdown

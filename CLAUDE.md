@@ -5,8 +5,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Project Overview
 
 Linux voice typing using streaming backends including Parakeet CTC and Moonshine, optional sherpa-onnx post-commit correction, and faster-whisper fallback, with a pre-recording buffer to capture speech beginnings.
+- **Local apps**: Prefer IBus atomic `commit_text`, then key injection fallback
+- **Remote desktop clients**: Auto-routes RustDesk/Remmina/FreeRDP-style focused windows to endpoint clipboard paste unless live keys are explicitly requested
 - **X11**: Uses xdotool for keyboard input
-- **Wayland**: Uses ydotool for keyboard input (auto-detected)
+- **Wayland**: Uses ydotool/uinput for keyboard input (auto-detected)
 
 ## Development Environment
 
@@ -109,6 +111,11 @@ VOICE_NIM_URL=http://127.0.0.1:9000 ./voice --streaming --streaming-model parake
 
 # Custom correction model
 ./voice --streaming --post-commit-correction --correction-model large-v3-turbo
+
+# Remote desktop output: RustDesk / Remmina / FreeRDP
+./voice --streaming --output-backend auto --remote-mode endpoint-paste
+./voice --streaming --remote-live-keys
+./voice --output-backend clipboard-paste
 ```
 
 Streaming-first architecture for low-latency dictation:
@@ -125,6 +132,26 @@ First run downloads models automatically:
 
 Without `--streaming`, behavior is identical to the existing batch mode.
 
+### Remote Desktop Output
+
+For RustDesk, Remmina, FreeRDP, KRDC, and similar clients, the reliable path is local STT plus remote-safe output routing:
+
+- default `--output-backend auto` uses IBus/key insertion for normal local apps
+- when a focused remote desktop window is detected, `--remote-mode auto` / `endpoint-paste` sets the local clipboard and sends Ctrl+V at utterance endpoint
+- streaming partials are deferred in endpoint-paste mode to avoid remote backspace/retype corruption
+- `--remote-live-keys` opts into live key injection for clients that forward local key events reliably
+- remote clipboard sync must be enabled in the client
+- clipboard-paste remote output skips post-commit correction to avoid destructive replacements
+
+Useful commands:
+```bash
+./voice --streaming --output-backend auto --remote-mode endpoint-paste
+./voice --streaming --remote-live-keys
+./voice --output-backend keys
+./voice --output-backend clipboard-paste
+./voice --no-remote-auto
+```
+
 ### Configuration
 Default config: `${XDG_CONFIG_HOME:-~/.config}/voice-typing/config.yaml`
 
@@ -132,7 +159,8 @@ Environment overrides (prefix `VOICE_`): `VOICE_MODEL`, `VOICE_DEVICE`, `VOICE_H
 `VOICE_COMMANDS`, `VOICE_NOISE_GATE`, `VOICE_PTT`, `VOICE_LOG_FILE`,
 `VOICE_ADAPTIVE_VAD` (or legacy `VOICE_NO_ADAPTIVE_VAD`),
 `VOICE_STREAMING`, `VOICE_STREAMING_MODEL`, `VOICE_POST_COMMIT_CORRECTION`,
-`VOICE_CORRECTION_MODEL`, `VOICE_NIM_URL`, `VOICE_NIM_API_KEY`.
+`VOICE_CORRECTION_MODEL`, `VOICE_OUTPUT_BACKEND`, `VOICE_REMOTE_MODE`,
+`VOICE_NIM_URL`, `VOICE_NIM_API_KEY`.
 
 ### Logs
 ```bash

@@ -5,6 +5,7 @@ Fast, accurate voice typing for Linux with IBus atomic text insertion, streaming
 ## Features
 
 - **IBus input method engine** — Atomic text insertion via `commit_text`. No key injection lag, no garbled output in terminals. One unified path for every app.
+- **Remote desktop output routing** — `auto` mode detects RustDesk/Remmina/FreeRDP-style windows and uses endpoint clipboard paste so dictated text lands inside RDP/RustDesk sessions instead of the local IBus context.
 - **Streaming-first STT** — NVIDIA Riva ASR NIM `nemotron-asr-streaming-nim` is now the default streaming backend. Local buffered `parakeet-ctc-0.6b` remains available as the zero-service fallback, older Parakeet CTC NIM profiles remain selectable, Moonshine native remains selectable, Parakeet TDT remains available as an optional post-commit correction model, and zipformer remains available as a sherpa fallback.
 - **Immediate IBus commit** — Endpoint text commits immediately on IBus. Optional post-commit correction can replace the last utterance afterward when enabled.
 - **GPU acceleration** — TF32 Tensor Cores, cudnn benchmark mode, pinned memory transfers, model warm-up.
@@ -142,6 +143,11 @@ VOICE_NIM_URL=http://127.0.0.1:9000 ./voice --streaming --streaming-model parake
 # Push-to-talk
 ./voice --ptt --ptt-hotkey f9 --ptt-mode hold
 
+# Remote desktop windows: RustDesk / Remmina / FreeRDP
+./voice --streaming --output-backend auto --remote-mode endpoint-paste
+./voice --streaming --remote-live-keys  # opt-in live typing into remote clients
+./voice --output-backend clipboard-paste # force paste mode for every target
+
 # Custom hotkey, language, model
 ./voice --hotkey f11 --language es --model medium
 
@@ -157,6 +163,41 @@ VOICE_NIM_URL=http://127.0.0.1:9000 ./voice --streaming --streaming-model parake
 
 - **X11/XWayland:** Press F12 (pynput handles it directly)
 - **Wayland:** Bind F12 in your compositor to `./voice-toggle`, or: `echo toggle | nc -U /run/user/$UID/voice-typing-$UID.sock`
+
+### Remote Desktop: RustDesk / Remmina / RDP
+
+Voice typing is local-mic/local-STT: you talk into this Linux machine, and the app inserts text into the focused window. Remote desktop clients often do not consume local IBus commits, so `--output-backend auto` switches to a remote-safe path when the focused window looks like RustDesk, Remmina, FreeRDP, KRDC, or virt-viewer.
+
+Recommended remote mode:
+
+```bash
+./voice --streaming --output-backend auto --remote-mode endpoint-paste
+```
+
+Behavior:
+- Local apps keep using IBus/key injection as before.
+- Focused remote desktop windows use clipboard paste at utterance endpoint.
+- Streaming partial text is intentionally not typed into remote windows in endpoint-paste mode; this avoids laggy/reordered backspaces over RDP/RustDesk.
+- Clipboard sync must be enabled in the remote client.
+- Post-commit correction is skipped for clipboard-paste remote output to avoid destructive remote backspace/retype corrections.
+
+Options:
+- `--output-backend auto` — default; IBus locally, endpoint paste for detected remote windows.
+- `--output-backend ibus` — force IBus-first local insertion.
+- `--output-backend keys` — force uinput/ydotool/xdotool key injection.
+- `--output-backend clipboard-paste` — force clipboard set + Ctrl+V.
+- `--remote-mode endpoint-paste` / `auto` — paste complete utterances into remote windows.
+- `--remote-live-keys` or `--remote-mode live-keys` — opt into live key typing inside remote windows.
+- `--no-remote-auto` — disable remote window detection.
+
+Smoke test before blaming STT:
+
+```bash
+printf 'hello from local voice typing' | wl-copy  # or xclip on X11
+./voice --output-backend clipboard-paste --model tiny
+```
+
+Focus a text box inside RustDesk/Remmina/RDP and speak one short phrase. If paste does not arrive, check remote clipboard sync and Wayland/uinput/ydotool permissions.
 
 ### Models
 
@@ -240,12 +281,14 @@ streaming: true
 streaming_model: nemotron-asr-streaming-nim
 post_commit_correction: false
 correction_model: parakeet-tdt-0.6b-v2
+output_backend: auto
+remote_mode: endpoint-paste
 commands: true
 noise_gate: true
 adaptive_vad: true
 ```
 
-Environment overrides (prefix `VOICE_`): `VOICE_MODEL`, `VOICE_DEVICE`, `VOICE_HOTKEY`, `VOICE_STREAMING`, `VOICE_STREAMING_MODEL`, `VOICE_POST_COMMIT_CORRECTION`, `VOICE_CORRECTION_MODEL`, `VOICE_COMMANDS`, `VOICE_NOISE_GATE`, `VOICE_PTT`, `VOICE_LOG_FILE`, `VOICE_ADAPTIVE_VAD`, `VOICE_NIM_URL`, `VOICE_NIM_API_KEY`. Legacy `VOICE_REFINEMENT*` env vars are still accepted.
+Environment overrides (prefix `VOICE_`): `VOICE_MODEL`, `VOICE_DEVICE`, `VOICE_HOTKEY`, `VOICE_STREAMING`, `VOICE_STREAMING_MODEL`, `VOICE_POST_COMMIT_CORRECTION`, `VOICE_CORRECTION_MODEL`, `VOICE_OUTPUT_BACKEND`, `VOICE_REMOTE_MODE`, `VOICE_COMMANDS`, `VOICE_NOISE_GATE`, `VOICE_PTT`, `VOICE_LOG_FILE`, `VOICE_ADAPTIVE_VAD`, `VOICE_NIM_URL`, `VOICE_NIM_API_KEY`. Legacy `VOICE_REFINEMENT*` env vars are still accepted.
 
 ## Project Structure
 

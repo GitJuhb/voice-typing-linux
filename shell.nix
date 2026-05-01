@@ -15,7 +15,8 @@ pkgs.mkShell {
     ydotool
     xdotool
     wmctrl     # Window focus commands
-    wl-clipboard  # Clipboard paste for refinement corrections
+    wl-clipboard  # Wayland clipboard paste for remote desktop output
+    xclip      # X11 clipboard paste for remote desktop output
     netcat     # Socket toggle (voice-toggle)
     xbindkeys  # Wayland hotkey fallback
     portaudio  # For pyaudio
