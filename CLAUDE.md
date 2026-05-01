@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Linux voice typing using faster-whisper with a pre-recording buffer to capture speech beginnings.
+Linux voice typing using streaming backends including Parakeet CTC and Moonshine, optional sherpa-onnx post-commit correction, and faster-whisper fallback, with a pre-recording buffer to capture speech beginnings.
 - **X11**: Uses xdotool for keyboard input
 - **Wayland**: Uses ydotool for keyboard input (auto-detected)
 
@@ -93,25 +93,35 @@ Press **F12** (default) to pause/resume transcription.
 
 The visualizer shows an FFT spectrum analyzer overlay that appears when speech is detected and auto-hides after silence. Uses GTK4 with layer-shell for Wayland overlay support.
 
-### Streaming STT (Two-Pass)
+### Streaming STT
 ```bash
 # Enable streaming mode (words appear as you speak)
 ./voice --streaming
 
-# Use smaller streaming model (~20MB instead of ~80MB)
+# Streaming model selection
+./voice --streaming --streaming-model parakeet-ctc-0.6b
+VOICE_NIM_URL=http://127.0.0.1:9000 ./voice --streaming --streaming-model parakeet-ctc-0.6b-nim
+VOICE_NIM_URL=http://127.0.0.1:9000 ./voice --streaming --streaming-model parakeet-ctc-1.1b-nim
 ./voice --streaming --streaming-model zipformer-en-20M
+./voice --streaming --streaming-model moonshine-tiny-streaming-en
+./voice --streaming --streaming-model moonshine-small-streaming-en
+./voice --streaming --streaming-model moonshine-medium-streaming-en
 
-# Custom refinement model
-./voice --streaming --refinement-model large-v3-turbo
+# Custom correction model
+./voice --streaming --post-commit-correction --correction-model large-v3-turbo
 ```
 
-Two-pass architecture for low-latency dictation:
-- **Pass 1 (sherpa-onnx)**: Streaming zipformer transducer processes each 20ms audio chunk in real-time, typing partial results immediately with backspace correction as partials change
-- **Pass 2 (faster-whisper turbo)**: After endpoint detection (silence), the accumulated audio is sent to faster-whisper large-v3-turbo for refinement. If the result differs, the streaming text is backspaced and replaced
+Streaming-first architecture for low-latency dictation:
+- **Pass 1 (streaming)**: This branch still defaults to buffered `parakeet-ctc-0.6b` for local streaming-style evaluation. The preferred GPU path is NVIDIA Riva ASR NIM with `parakeet-ctc-1.1b-nim` or `parakeet-ctc-0.6b-nim`. Moonshine native and zipformer remain selectable.
+- **Pass 2 (optional post-commit correction)**: When enabled, endpoint audio is sent to Parakeet TDT after the text is already committed. Whisper remains available as a fallback correction model.
 
 First run downloads models automatically:
-- Streaming model: `~/.cache/sherpa-onnx/` (~80MB zipformer-en, ~20MB zipformer-en-20M)
-- Refinement model: `~/.cache/huggingface/` (~1.5GB large-v3-turbo)
+- Streaming model:
+  - `~/.cache/huggingface/` for Parakeet CTC
+  - `~/.cache/moonshine_voice/` for native Moonshine
+  - `~/.cache/sherpa-onnx/` for zipformer
+  - local NVIDIA Riva ASR NIM for `parakeet-ctc-0.6b-nim` / `parakeet-ctc-1.1b-nim`
+- Correction model: `~/.cache/sherpa-onnx/` (~300MB parakeet-tdt-0.6b-v2) or `~/.cache/huggingface/` for Whisper fallback
 
 Without `--streaming`, behavior is identical to the existing batch mode.
 
@@ -121,7 +131,8 @@ Default config: `${XDG_CONFIG_HOME:-~/.config}/voice-typing/config.yaml`
 Environment overrides (prefix `VOICE_`): `VOICE_MODEL`, `VOICE_DEVICE`, `VOICE_HOTKEY`,
 `VOICE_COMMANDS`, `VOICE_NOISE_GATE`, `VOICE_PTT`, `VOICE_LOG_FILE`,
 `VOICE_ADAPTIVE_VAD` (or legacy `VOICE_NO_ADAPTIVE_VAD`),
-`VOICE_STREAMING`, `VOICE_STREAMING_MODEL`, `VOICE_REFINEMENT_MODEL`.
+`VOICE_STREAMING`, `VOICE_STREAMING_MODEL`, `VOICE_POST_COMMIT_CORRECTION`,
+`VOICE_CORRECTION_MODEL`, `VOICE_NIM_URL`, `VOICE_NIM_API_KEY`.
 
 ### Logs
 ```bash
@@ -281,7 +292,7 @@ Phrases that look like sentences are typed as dictation:
 
 ### Core Files
 - `enhanced-voice-typing.py` - Main implementation
-- `streaming_stt.py` - Streaming STT wrapper for sherpa-onnx (optional)
+- `streaming_stt.py` - Streaming backends and offline model wrappers
 - `commands.py` - Voice command detection and execution
 - `audio_visualizer.py` - GTK4 spectrum analyzer overlay
 - `voice` - Launcher script with defaults
@@ -302,8 +313,8 @@ The application uses a **producer-consumer pattern** with up to 6 threads:
 
 2. **Transcription Worker Thread** - Background processing
    - Pulls audio from `transcription_queue`
-   - Batch mode: runs Whisper inference (1-2s), types result
-   - Streaming mode: acts as refinement pass, compares turbo result with streaming text
+   - Batch mode: runs the selected offline model, types result
+   - Streaming mode: acts as an optional post-commit correction pass, compares final output with streaming text
 
 3. **Hotkey Listener Thread** (pynput) - Global hotkey
    - Toggles `is_paused` flag
@@ -318,11 +329,11 @@ The application uses a **producer-consumer pattern** with up to 6 threads:
    - Computes FFT spectrum at ~30fps
    - Auto-shows on speech, hides after silence delay
 
-6. **Streaming Worker Thread** (sherpa-onnx) - Real-time STT (optional, --streaming)
+6. **Streaming Worker Thread** (Parakeet CTC / Moonshine native / zipformer) - Real-time STT (optional, --streaming)
    - Consumes 20ms chunks from `streaming_queue`
-   - Feeds sherpa-onnx OnlineRecognizer for partial results
+   - Feeds the active streaming backend for partial results
    - Types partials incrementally with backspace correction
-   - On endpoint detection, queues audio for refinement (thread 2)
+   - On endpoint detection, commits text immediately and can queue audio for optional correction (thread 2)
    - Protected by `streaming_lock` for `current_streaming_text`
 
 ### Audio Pipeline
@@ -330,7 +341,7 @@ The application uses a **producer-consumer pattern** with up to 6 threads:
 2. **VAD Detection**: WebRTC VAD (aggressiveness=2) detects speech
 3. **Recording**: Pre-buffer + live audio + 800ms post-silence
 4. **Queue**: Audio buffer copied and queued (non-blocking)
-5. **Transcription**: Worker thread runs Whisper with beam_size=5
+5. **Transcription**: Worker thread runs the selected offline model
 6. **Output**: xdotool types transcribed text
 
 ### Key Code Locations
@@ -339,19 +350,21 @@ The application uses a **producer-consumer pattern** with up to 6 threads:
 - Socket listener: `enhanced-voice-typing.py:692`
 - Audio callback: `enhanced-voice-typing.py:996`
 - Transcription worker: `enhanced-voice-typing.py:1108`
-- Whisper transcription: `enhanced-voice-typing.py:1129`
+- Offline transcription: `enhanced-voice-typing.py:1129`
 - Streaming worker: `enhanced-voice-typing.py:1295`
 - Streaming partial typing: `enhanced-voice-typing.py:1356`
 - StreamingSTT class: `streaming_stt.py:50`
 
-## Whisper Settings (Accuracy-Optimized)
+## Offline Transcription Notes
 
-Settings in `_process_audio()` at line 336:
+Whisper-specific settings live in `_process_audio()` and only apply when the active model is a Whisper backend:
 - `beam_size=5` - Beam search for accuracy
 - `condition_on_previous_text=True` - Context awareness enabled
 - `vad_filter=True` with `min_silence_duration_ms=1000`, `speech_pad_ms=400`
 - Quality filters use faster-whisper defaults
 - Context prompt: Last 200 chars of previous transcription
+
+Parakeet post-commit correction uses sherpa-onnx offline decoding instead of the Whisper beam-search path.
 
 ### GPU Optimizations
 When `--device cuda`:

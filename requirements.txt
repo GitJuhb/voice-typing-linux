@@ -19,5 +19,11 @@ evdev>=1.6.0
 PyGObject>=3.42.0  # GTK4 Python bindings
 pycairo>=1.24.0    # Cairo drawing
 
-# Streaming STT (optional - only needed for --streaming mode)
-sherpa-onnx>=1.10.0  # Real-time streaming speech recognition
+# Native Moonshine streaming + sherpa-onnx offline Parakeet/Moonshine-class models
+moonshine-voice==0.0.49
+sherpa-onnx>=1.12.28
+websocket-client>=1.8.0
+
+# Parakeet CTC buffered streaming backend (Hugging Face native support)
+transformers>=4.57.3
+librosa>=0.10.2

@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
 Enhanced voice typing with pre-recording buffer
-Combines faster-whisper with pre-buffer technique from RealtimeSTT
+Combines Parakeet CTC, Moonshine native, sherpa-onnx, and
+faster-whisper with pre-buffer technique from RealtimeSTT
 
 Features:
 - Thread-safe transcription (no blocking in audio callback)
 - Proper buffer timing for natural speech
-- Accurate Whisper settings (beam_size=5, quality filters enabled)
+- Accurate offline transcription with pluggable backends
 - Pause/resume hotkey (F12 default, with Wayland socket fallback)
 - Voice command detection (window management, text editing, custom commands)
 """
@@ -24,11 +25,19 @@ import threading
 import queue
 import socket
 import os
+import re
 import secrets
 import json
 import logging
 from logging.handlers import RotatingFileHandler
-from faster_whisper import WhisperModel
+
+try:
+    from faster_whisper import WhisperModel
+
+    WHISPER_AVAILABLE = True
+except ImportError:
+    WhisperModel = None
+    WHISPER_AVAILABLE = False
 
 # Voice command support
 try:
@@ -62,13 +71,56 @@ try:
 except ImportError:
     VISUALIZER_AVAILABLE = False
 
-# Streaming STT (optional - sherpa-onnx)
+# STT backend helpers
 try:
-    from streaming_stt import StreamingSTT
+    from streaming_stt import (
+        OfflineSTT,
+        StreamingSTT,
+        get_offline_model_names,
+        get_streaming_model_names,
+        is_sherpa_offline_model,
+        sherpa_onnx_available,
+        streaming_model_available,
+        streaming_model_install_hint,
+    )
 
-    STREAMING_AVAILABLE = True
+    STT_HELPERS_AVAILABLE = True
 except ImportError:
-    STREAMING_AVAILABLE = False
+    OfflineSTT = None
+    StreamingSTT = None
+
+    def get_offline_model_names():
+        return []
+
+    def get_streaming_model_names():
+        return []
+
+    def is_sherpa_offline_model(_model_name):
+        return False
+
+    def sherpa_onnx_available():
+        return False
+
+    def streaming_model_available(_model_name):
+        return False
+
+    def streaming_model_install_hint(_model_name):
+        return "Install the optional streaming backend dependencies"
+
+    STT_HELPERS_AVAILABLE = False
+
+
+WHISPER_MODELS = [
+    "tiny",
+    "base",
+    "small",
+    "medium",
+    "large",
+    "distil-large-v3",
+    "distil-medium",
+    "large-v3",
+    "large-v3-turbo",
+]
 
 # Direct uinput key injection (replaces ydotool for Wayland)
 try:
@@ -314,8 +366,17 @@ class IBusClient:
 
     @property
     def is_available(self):
-        """Check if IBus engine socket exists."""
-        return os.path.exists(self.SOCKET_PATH)
+        """Check if the IBus engine socket can be reached."""
+        if self._sock is not None:
+            return True
+        if not os.path.exists(self.SOCKET_PATH):
+            return False
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+                sock.connect(self.SOCKET_PATH)
+            return True
+        except (ConnectionError, OSError):
+            return False
 
     @property
     def supports_surrounding_text(self):
@@ -438,9 +499,9 @@ CONFIG_DEFAULTS = {
     "viz_position": "bottom-right",
     "viz_hide_delay": 1500,
     "streaming": False,
-    "streaming_model": "zipformer-en",
-    "refinement": False,
-    "refinement_model": "large-v3-turbo",
+    "streaming_model": "nemotron-asr-streaming-nim",
+    "post_commit_correction": False,
+    "correction_model": "parakeet-tdt-0.6b-v2",
 }
 
 
@@ -516,12 +577,21 @@ def _apply_env_overrides(config: dict) -> dict:
         "viz_hide_delay": "VOICE_VIZ_HIDE_DELAY",
         "streaming": "VOICE_STREAMING",
         "streaming_model": "VOICE_STREAMING_MODEL",
-        "refinement": "VOICE_REFINEMENT",
-        "refinement_model": "VOICE_REFINEMENT_MODEL",
+        "post_commit_correction": "VOICE_POST_COMMIT_CORRECTION",
+        "correction_model": "VOICE_CORRECTION_MODEL",
+    }
+
+    legacy_mapping = {
+        "post_commit_correction": "VOICE_REFINEMENT",
+        "correction_model": "VOICE_REFINEMENT_MODEL",
     }
 
     for key, env_var in mapping.items():
         if env_var in os.environ:
+            overrides[key] = os.environ[env_var]
+
+    for key, env_var in legacy_mapping.items():
+        if env_var in os.environ and key not in overrides:
             overrides[key] = os.environ[env_var]
 
     if "VOICE_NO_ADAPTIVE_VAD" in os.environ and "adaptive_vad" not in overrides:
@@ -543,7 +613,7 @@ def _apply_env_overrides(config: dict) -> dict:
             "adaptive_vad",
             "viz",
             "streaming",
-            "refinement",
+            "post_commit_correction",
         ):
             merged[key] = _parse_bool(value)
         elif key in (
@@ -648,9 +718,9 @@ class VoiceTyping:
         viz_position="bottom-right",
         viz_hide_delay=1500,
         streaming_enabled=False,
-        streaming_model="zipformer-en",
-        refinement_enabled=False,
-        refinement_model="large-v3-turbo",
+        streaming_model="nemotron-asr-streaming-nim",
+        post_commit_correction_enabled=False,
+        correction_model="parakeet-tdt-0.6b-v2",
     ):
         self.model_size = model_size
         self.device = device
@@ -677,12 +747,6 @@ class VoiceTyping:
 
         # IBus client for atomic text insertion (preferred over key injection)
         self.ibus_client = IBusClient()
-        self._pending_refinement_text = (
-            None  # Terminal: preedit text awaiting refinement
-        )
-        self._pending_refinement_prefix = (
-            ""  # Leading space for inter-utterance spacing
-        )
         if self.ibus_client.is_available:
             print("✅ IBus engine available (atomic text insertion)")
         else:
@@ -810,23 +874,54 @@ class VoiceTyping:
         self.viz_position = viz_position
         self.viz_hide_delay = viz_hide_delay
 
-        # Streaming STT (sherpa-onnx streaming + optional faster-whisper refinement)
-        self.streaming_enabled = streaming_enabled and STREAMING_AVAILABLE
         self.streaming_model = streaming_model
-        self.refinement_enabled = refinement_enabled and streaming_enabled
-        self.refinement_model = refinement_model
+        # Streaming STT backends + optional post-commit correction
+        self.streaming_enabled = (
+            streaming_enabled
+            and STT_HELPERS_AVAILABLE
+            and streaming_model_available(self.streaming_model)
+        )
+        self.refinement_enabled = (
+            post_commit_correction_enabled and self.streaming_enabled
+        )
+        self.refinement_model = correction_model
         self.streaming_stt = None
         self.streaming_thread = None
         self.streaming_queue = queue.Queue(maxsize=200)  # ~4s of 20ms chunks
         self.current_streaming_text = ""
+        self.visible_streaming_text = ""
         self.streaming_lock = threading.Lock()
+        self.streaming_preview_tail_words = 1
+        self.streaming_preview_max_replace_chars = 24
+        self.streaming_use_ibus_preedit = False
 
-        if streaming_enabled and not STREAMING_AVAILABLE:
-            print("streaming requested but sherpa-onnx not installed")
-            print("   Install with: pip install sherpa-onnx")
+        if streaming_enabled and not self.streaming_enabled:
+            print(f"streaming requested but '{self.streaming_model}' is not available")
+            print(f"   {streaming_model_install_hint(self.streaming_model)}")
+        elif (
+            self.streaming_enabled
+            and self.streaming_model.startswith("moonshine-")
+            and self.language
+            and self.language.lower() != "en"
+        ):
+            print(
+                "⚠️  Moonshine native models configured here are English-only; use zipformer or Whisper for other languages"
+            )
+        elif (
+            self.streaming_enabled
+            and (
+                self.streaming_model.startswith("parakeet-ctc-")
+                or self.streaming_model.startswith("nemotron-")
+            )
+            and self.language
+            and self.language.lower() != "en"
+        ):
+            print(
+                "⚠️  This NVIDIA streaming backend is English-only; use zipformer or Whisper for other languages"
+            )
 
         # Model performance suggestions
-        if device == "cuda":
+        if device == "cuda" and model_size in WHISPER_MODELS:
             if model_size in ["large", "large-v3"]:
                 print(f"💡 Performance tip: Consider 'distil-large-v3' for 1.5x speed")
             elif model_size == "small":
@@ -834,6 +929,100 @@ class VoiceTyping:
 
         print(f"Initializing Voice Typing (model: {model_size}, device: {device})")
         self.initialize()
+
+    def _uses_sherpa_offline_model(self, model_name: str) -> bool:
+        return STT_HELPERS_AVAILABLE and is_sherpa_offline_model(model_name)
+
+    def _onnx_provider(self) -> str:
+        return "cuda" if self.device == "cuda" else "cpu"
+
+    def _load_offline_model(self, model_name: str):
+        if not STT_HELPERS_AVAILABLE or not sherpa_onnx_available():
+            raise RuntimeError(
+                "sherpa-onnx is required for offline models such as "
+                f"'{model_name}'. Install with: pip install 'sherpa-onnx>=1.12.28'"
+            )
+
+        provider = self._onnx_provider()
+        print(f"Loading sherpa-onnx model '{model_name}' on {provider}...")
+        model = OfflineSTT(
+            model_name=model_name,
+            sample_rate=self.sample_rate,
+            provider=provider,
+        )
+        model.create_recognizer()
+        print("Model loaded successfully!")
+        return model, "sherpa-onnx"
+
+    def _load_whisper_model(self, model_name: str):
+        if not WHISPER_AVAILABLE:
+            raise RuntimeError(
+                "faster-whisper is required for Whisper models. "
+                "Install with: pip install faster-whisper"
+            )
+
+        print(f"Loading Whisper model '{model_name}' on {self.device}...")
+        model = WhisperModel(
+            model_name,
+            device=self.device,
+            compute_type="int8_float16" if self.device == "cuda" else "int8",
+        )
+        print("Model loaded successfully!")
+        return model, "faster-whisper"
+
+    def _load_transcription_model(self, model_name: str):
+        if self._uses_sherpa_offline_model(model_name):
+            return self._load_offline_model(model_name)
+        return self._load_whisper_model(model_name)
+
+    def _warm_up_transcription_model(self):
+        if self.model is None:
+            return
+
+        print("Warming up model...")
+        dummy_audio = np.zeros(16000, dtype=np.float32)
+        if self.model_backend == "sherpa-onnx":
+            self.model.transcribe(dummy_audio)
+        else:
+            list(self.model.transcribe(dummy_audio, language=self.language or "en"))
+        print("Model warmed up!")
+
+    def _transcribe_audio(self, audio_float: np.ndarray, initial_prompt: str, is_refinement: bool) -> str:
+        if self.model_backend == "sherpa-onnx":
+            return self.model.transcribe(audio_float)
+
+        if is_refinement:
+            segments, _ = self.model.transcribe(
+                audio_float,
+                language=self.language or "en",
+                initial_prompt=initial_prompt,
+                temperature=0.0,
+                beam_size=3,
+                condition_on_previous_text=False,
+                without_timestamps=True,
+                vad_filter=True,
+                vad_parameters=dict(
+                    min_silence_duration_ms=500,
+                    speech_pad_ms=200,
+                ),
+            )
+        else:
+            segments, _ = self.model.transcribe(
+                audio_float,
+                language=self.language or "en",
+                initial_prompt=initial_prompt,
+                temperature=0.0,
+                beam_size=5,
+                condition_on_previous_text=True,
+                without_timestamps=True,
+                vad_filter=True,
+                vad_parameters=dict(
+                    min_silence_duration_ms=1000,
+                    speech_pad_ms=400,
+                ),
+            )
+
+        return " ".join(segment.text.strip() for segment in segments).strip()
 
     def initialize(self):
         """Initialize all components"""
@@ -885,40 +1074,44 @@ class VoiceTyping:
 
             # Initialize streaming STT if enabled
             if self.streaming_enabled:
-                from streaming_stt import StreamingSTT
-
                 self.streaming_stt = StreamingSTT(
                     model_name=self.streaming_model,
                     sample_rate=self.sample_rate,
+                    device=self.device,
                 )
                 self.streaming_stt.create_recognizer()
                 # In streaming mode, reduce post-buffer since endpoint detection
-                # is handled by sherpa-onnx
+                # is handled by the active streaming backend
                 self.post_buffer_size = 20  # 400ms instead of 800ms
 
-            # Initialize Whisper model (skip if streaming-only without refinement)
+            # Initialize offline model (skip if streaming-only without post-commit correction)
             if not self.streaming_enabled or self.refinement_enabled:
-                whisper_model = (
+                runtime_model = (
                     self.refinement_model
                     if self.refinement_enabled
                     else self.model_size
                 )
-                print(f"Loading Whisper model '{whisper_model}' on {self.device}...")
-                self.model = WhisperModel(
-                    whisper_model,
-                    device=self.device,
-                    compute_type="int8_float16" if self.device == "cuda" else "int8",
+                self.model_name = runtime_model
+                self.model, self.model_backend = self._load_transcription_model(
+                    runtime_model
                 )
-                print("Model loaded successfully!")
 
-                # Warm up the model
-                print("Warming up model...")
-                dummy_audio = np.zeros(16000, dtype=np.float32)
-                list(self.model.transcribe(dummy_audio, language=self.language or "en"))
-                print("Model warmed up!")
+                if self.language and self.language.lower() != "en":
+                    if runtime_model == "parakeet-tdt-0.6b-v2":
+                        print(
+                            "⚠️  parakeet-tdt-0.6b-v2 is English-only; use Whisper for non-English dictation"
+                        )
+                    elif runtime_model.startswith("moonshine-"):
+                        print(
+                            "⚠️  Moonshine models configured here are English-only; use Whisper for non-English dictation"
+                        )
+
+                self._warm_up_transcription_model()
             else:
-                print("Streaming-only mode (no Whisper refinement)")
+                print("Streaming-only mode (no offline correction)")
                 self.model = None
+                self.model_backend = None
+                self.model_name = None
 
             # Initialize audio stream
             self.stream = self.audio.open(
@@ -951,14 +1144,22 @@ class VoiceTyping:
             raise
 
     def _toggle_pause(self):
-        """Toggle pause state"""
-        self.is_paused = not self.is_paused
-        if self.is_paused:
+        """Toggle pause state."""
+        if not self.is_paused:
+            self.is_paused = True
             print(f"\n⏸️  PAUSED - Press {self.hotkey.upper()} to resume")
             self._notify("Voice typing", "Paused")
-        else:
-            print(f"\n▶️  RESUMED - Listening...")
-            self._notify("Voice typing", "Resumed")
+            return
+
+        # Keep audio callbacks gated while refreshing the streaming backend. NIM
+        # can close idle websocket sessions during pauses, so reconnect before
+        # exposing the mic stream again.
+        if self.streaming_enabled:
+            self._recover_streaming_backend("resume")
+
+        self.is_paused = False
+        print(f"\n▶️  RESUMED - Listening...")
+        self._notify("Voice typing", "Resumed")
 
     def _start_hotkey_listener(self):
         """Start hotkey listener - tries pynput, falls back to socket for Wayland"""
@@ -1040,15 +1241,16 @@ class VoiceTyping:
             print(f"⚠️  Failed to write socket token: {e}")
 
     def _socket_listener(self):
-        """Listen for pause/resume commands via socket"""
+        """Listen for pause/resume/status commands via socket."""
         while self.running:
+            conn = None
             try:
                 conn, _ = self.socket_server.accept()
                 data = conn.recv(128).decode(errors="ignore").strip()
-                conn.close()
 
                 parts = data.split()
                 if not parts:
+                    self._socket_send_response(conn, "error empty-command")
                     continue
 
                 cmd = parts[0]
@@ -1059,6 +1261,7 @@ class VoiceTyping:
                         print(
                             "⚠️  Invalid socket token received (further warnings suppressed)"
                         )
+                    self._socket_send_response(conn, "error invalid-token")
                     continue
 
                 if cmd in ("toggle", "pause", "resume"):
@@ -1068,8 +1271,12 @@ class VoiceTyping:
                         self._toggle_pause()
                     elif cmd == "resume" and self.is_paused:
                         self._toggle_pause()
+                    self._socket_send_response(conn, f"ok {self._pause_state_label()}")
+                elif cmd == "status":
+                    self._socket_send_response(conn, f"status {self._pause_state_label()}")
                 elif cmd in ("ptt_down", "ptt_up", "ptt_toggle"):
                     if not self.ptt_enabled:
+                        self._socket_send_response(conn, "error ptt-disabled")
                         continue
                     if cmd == "ptt_down":
                         self._set_ptt(True)
@@ -1077,12 +1284,33 @@ class VoiceTyping:
                         self._set_ptt(False)
                     else:
                         self._set_ptt(not self.ptt_active)
+                    self._socket_send_response(
+                        conn, "ok ptt-on" if self.ptt_active else "ok ptt-off"
+                    )
+                else:
+                    self._socket_send_response(conn, "error unsupported-command")
             except socket.timeout:
                 continue
             except Exception:
                 if self.running:
                     continue
                 break
+            finally:
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+
+    def _socket_send_response(self, conn, message: str):
+        """Best-effort response for socket control clients."""
+        try:
+            conn.sendall((message + "\n").encode())
+        except Exception:
+            pass
+
+    def _pause_state_label(self) -> str:
+        return "paused" if self.is_paused else "active"
 
     def _print_wayland_instructions(self):
         """Print instructions for Wayland hotkey setup"""
@@ -1379,7 +1607,7 @@ class VoiceTyping:
         # Push to streaming STT queue (non-blocking, every chunk)
         if self.streaming_enabled:
             try:
-                self.streaming_queue.put_nowait(raw_chunk.copy())
+                self.streaming_queue.put_nowait((raw_chunk.copy(), is_speech))
             except queue.Full:
                 pass  # Drop if queue full - streaming is best-effort
 
@@ -1397,7 +1625,8 @@ class VoiceTyping:
             audio_chunk, _ = self._apply_agc(raw_chunk, raw_rms)
 
         # In streaming mode, the streaming_worker handles audio accumulation,
-        # endpoint detection, and queuing for refinement. Skip the batch VAD path.
+        # endpoint detection, and optional post-commit correction queueing.
+        # Skip the batch VAD path.
         if not self.streaming_enabled:
             with self.buffer_lock:
                 if is_speech:
@@ -1461,7 +1690,7 @@ class VoiceTyping:
                 self.dropped_transcriptions += 1
 
     def transcription_worker(self):
-        """Background thread for Whisper transcription (also serves as refinement in streaming mode)"""
+        """Background thread for offline transcription and optional correction."""
         while self.running:
             try:
                 queue_item = self.transcription_queue.get(timeout=0.5)
@@ -1489,10 +1718,10 @@ class VoiceTyping:
                 print(f"❌ Transcription worker error: {e}")
 
     def _process_audio(self, recording_buffer, streaming_text=None):
-        """Process recorded audio with Whisper.
+        """Process recorded audio with the active offline model.
 
-        In streaming mode (streaming_text is not None), this acts as the refinement
-        pass: compare turbo result with streaming output and correct if different.
+        In streaming mode (streaming_text is not None), this acts as the optional
+        post-commit correction pass after the streaming backend finishes an utterance.
         """
         if not recording_buffer:
             return
@@ -1504,7 +1733,7 @@ class VoiceTyping:
             is_refinement = self.streaming_enabled and streaming_text is not None
 
             if is_refinement:
-                print("🔄 Refining...")
+                print("🔄 Correcting...")
             else:
                 print("⚡ Transcribing...")
             start_time = time.time()
@@ -1516,75 +1745,31 @@ class VoiceTyping:
             )
 
             if is_refinement:
-                # Refinement pass: turbo with beam_size=3 for reliability.
-                # Uses clean prompt (only refined text, not streaming errors)
-                # to prevent hallucination like "you" / "so" on long segments.
                 refinement_prompt = (
                     self.previous_text[-200:]
                     if self.previous_text
                     else "Clear, well-punctuated dictation."
                 )
-                segments, info = self.model.transcribe(
-                    audio_float,
-                    language=self.language or "en",
-                    initial_prompt=refinement_prompt,
-                    temperature=0.0,
-                    beam_size=3,
-                    condition_on_previous_text=False,
-                    without_timestamps=True,
-                    vad_filter=True,
-                    vad_parameters=dict(
-                        min_silence_duration_ms=500,
-                        speech_pad_ms=200,
-                    ),
+                text = self._transcribe_audio(
+                    audio_float, refinement_prompt, is_refinement=True
                 )
             else:
-                # Batch mode: full accuracy settings
-                segments, info = self.model.transcribe(
-                    audio_float,
-                    language=self.language or "en",
-                    initial_prompt=batch_prompt,
-                    temperature=0.0,
-                    beam_size=5,
-                    condition_on_previous_text=True,
-                    without_timestamps=True,
-                    vad_filter=True,
-                    vad_parameters=dict(
-                        min_silence_duration_ms=1000,
-                        speech_pad_ms=400,
-                    ),
+                text = self._transcribe_audio(
+                    audio_float, batch_prompt, is_refinement=False
                 )
-
-            text = ""
-            for segment in segments:
-                text += segment.text.strip() + " "
-            text = text.strip()
 
             if text:
                 transcribe_time = time.time() - start_time
 
                 if is_refinement:
-                    # Compare refinement result with streaming output
+                    # Compare post-commit correction result with streaming output
                     streaming_normalized = " ".join(streaming_text.lower().split())
                     refined_normalized = " ".join(text.lower().split())
 
-                    # IBus preedit path: text is still in preedit,
-                    # clear preedit and commit the final version atomically.
-                    ibus_preedit = (
-                        self.ibus_client.is_available
-                        and self._pending_refinement_text is not None
-                    )
-
                     if streaming_normalized == refined_normalized:
-                        if ibus_preedit:
-                            prefix = self._pending_refinement_prefix
-                            self._pending_refinement_text = None
-                            self._pending_refinement_prefix = ""
-                            self.ibus_client.send_preedit("")
-                            self.ibus_client.send_commit(prefix + text)
                         print(f"✅ [{transcribe_time:.2f}s] Confirmed: '{text}'")
                     else:
-                        # Sanity check: reject refinement if output is much shorter
+                        # Sanity check: reject correction if output is much shorter
                         stream_word_count = len(streaming_normalized.split())
                         refined_word_count = len(refined_normalized.split())
                         too_short = (
@@ -1605,91 +1790,49 @@ class VoiceTyping:
                         )
 
                         if too_short:
-                            if ibus_preedit:
-                                prefix = self._pending_refinement_prefix
-                                self._pending_refinement_text = None
-                                self._pending_refinement_prefix = ""
-                                self.ibus_client.send_preedit("")
-                                self.ibus_client.send_commit(prefix + streaming_text)
                             print(
-                                f"⚠️  [{transcribe_time:.2f}s] Rejected refinement (too short {refined_word_count}/{stream_word_count} words): '{streaming_text}' -> '{text}'"
+                                f"⚠️  [{transcribe_time:.2f}s] Rejected correction (too short {refined_word_count}/{stream_word_count} words): '{streaming_text}' -> '{text}'"
                             )
                             self._log(
-                                f"refinement_rejected streaming='{streaming_text}' refined='{text}' reason=too_short"
+                                f"correction_rejected streaming='{streaming_text}' corrected='{text}' reason=too_short"
                             )
                         elif new_streaming:
-                            # User moved on — _type_streaming_partial will commit pending
                             print(
                                 f"⏭️  [{transcribe_time:.2f}s] Skipped correction (user moved on): '{streaming_text}' -> '{text}'"
                             )
                             self._log(
-                                f"refinement_skipped streaming='{streaming_text}' refined='{text}' reason=user_moved_on"
+                                f"correction_skipped streaming='{streaming_text}' corrected='{text}' reason=user_moved_on"
                             )
-                        elif no_overlap and not ibus_preedit:
+                        elif no_overlap:
                             print(
-                                f"⚠️  [{transcribe_time:.2f}s] Rejected refinement (no overlap): '{streaming_text}' -> '{text}'"
+                                f"⚠️  [{transcribe_time:.2f}s] Rejected correction (no overlap): '{streaming_text}' -> '{text}'"
                             )
                             self._log(
-                                f"refinement_rejected streaming='{streaming_text}' refined='{text}' reason=no_overlap"
-                            )
-                        elif ibus_preedit:
-                            # IBus: clear preedit and commit refined text atomically
-                            prefix = self._pending_refinement_prefix
-                            self._pending_refinement_text = None
-                            self._pending_refinement_prefix = ""
-                            self.ibus_client.send_preedit("")
-                            self.ibus_client.send_commit(prefix + text)
-                            print(
-                                f"🔄 [{transcribe_time:.2f}s] Refined: '{streaming_text}' -> '{text}'"
-                            )
-                            self._log(
-                                f"refinement_correction streaming='{streaming_text}' refined='{text}'"
+                                f"correction_rejected streaming='{streaming_text}' corrected='{text}' reason=no_overlap"
                             )
                         else:
-                            # Evdev fallback: LCP diff with backspace correction
-                            s_lower = streaming_text.lower()
-                            t_lower = text.lower()
-                            common_len = 0
-                            for ci in range(min(len(s_lower), len(t_lower))):
-                                if s_lower[ci] == t_lower[ci]:
-                                    common_len = ci + 1
-                                else:
-                                    break
-                            chars_to_delete = len(streaming_text) - common_len
-                            new_suffix = text[common_len:]
-
                             max_replace = 100
+                            chars_to_delete, _ = self._compute_replacement(
+                                streaming_text, text
+                            )
                             if chars_to_delete > max_replace:
                                 print(
-                                    f"⚠️  [{transcribe_time:.2f}s] Skipped refinement (replace={chars_to_delete}>{max_replace}): '{streaming_text}' -> '{text}'"
+                                    f"⚠️  [{transcribe_time:.2f}s] Skipped correction (replace={chars_to_delete}>{max_replace}): '{streaming_text}' -> '{text}'"
                                 )
                                 self._log(
-                                    f"refinement_skipped streaming='{streaming_text}' refined='{text}' reason=replace_too_large chars={chars_to_delete}"
-                                )
-                            elif no_overlap:
-                                print(
-                                    f"⚠️  [{transcribe_time:.2f}s] Rejected refinement (no overlap): '{streaming_text}' -> '{text}'"
-                                )
-                                self._log(
-                                    f"refinement_rejected streaming='{streaming_text}' refined='{text}' reason=no_overlap"
+                                    f"correction_skipped streaming='{streaming_text}' corrected='{text}' reason=replace_too_large chars={chars_to_delete}"
                                 )
                             else:
+                                chars_to_delete = self._replace_typed_text(
+                                    streaming_text, text
+                                )
+                                self._update_last_typed_history(streaming_text, text)
                                 print(
-                                    f"🔄 [{transcribe_time:.2f}s] Refined (bs={chars_to_delete}): '{streaming_text}' -> '{text}'"
+                                    f"🔄 [{transcribe_time:.2f}s] Corrected (bs={chars_to_delete}): '{streaming_text}' -> '{text}'"
                                 )
                                 self._log(
-                                    f"refinement_correction streaming='{streaming_text}' refined='{text}' bs={chars_to_delete}"
+                                    f"post_commit_correction streaming='{streaming_text}' corrected='{text}' bs={chars_to_delete}"
                                 )
-                                if chars_to_delete > 0 or new_suffix:
-                                    if self.key_injector:
-                                        self.key_injector.replace_text(
-                                            chars_to_delete, new_suffix
-                                        )
-                                    else:
-                                        if chars_to_delete > 0:
-                                            self._send_backspaces(chars_to_delete)
-                                        if new_suffix:
-                                            self._type_raw(new_suffix)
                 else:
                     print(f"✅ [{transcribe_time:.2f}s] '{text}'")
 
@@ -1704,23 +1847,14 @@ class VoiceTyping:
                 self.previous_text = (self.previous_text + " " + text)[-500:]
 
                 # Flag audio stream for reset after long transcriptions.
-                # PyAudio's internal ring buffer can overflow during long Whisper runs,
+                # PyAudio's internal ring buffer can overflow during long offline runs,
                 # leaving the stream unable to deliver new audio callbacks.
                 # The main loop handles the actual restart (thread-safe).
                 if transcribe_time > 0.5 and not self.streaming_enabled:
                     self._stream_reset_needed = True
 
-                # In refinement mode, text is already typed by streaming - skip unless corrected
+                # In correction mode, text is already typed by streaming.
                 if is_refinement:
-                    # Process punctuation on the final text for history
-                    if self.commands_enabled and COMMANDS_AVAILABLE:
-                        from commands import process_punctuation
-
-                        text = process_punctuation(text)
-                    # Update typing history with the final result
-                    self.typing_history.append((text, len(text)))
-                    if len(self.typing_history) > self.max_history:
-                        self.typing_history.pop(0)
                     return
 
                 # Process punctuation commands if commands enabled
@@ -1786,15 +1920,16 @@ class VoiceTyping:
     def streaming_worker(self):
         """Background thread for streaming STT (Pass 1: real-time partial results).
 
-        Drains all available chunks in a batch, feeds them to sherpa-onnx,
-        then updates the display once. Throttles typing to ~150ms intervals
-        to prevent rapid-fire corrections.
-        When an endpoint is detected, queues the full audio for refinement.
+        Drains all available chunks in a batch, feeds them to the configured
+        streaming recognizer, then updates the display once. Native Moonshine
+        emits line updates/completions as audio arrives; zipformer uses sherpa's
+        online endpoint detection. When an utterance completes, queue the full
+        audio for optional post-commit correction.
         """
-        # Accumulate chunks for refinement pass
+        # Accumulate chunks for optional post-commit correction
         streaming_audio_buffer = []
         last_type_time = 0.0
-        type_interval = 0.15  # Minimum seconds between typing updates
+        type_interval = 0.04  # Minimum seconds between typing updates
         pending_partial = ""  # Latest partial waiting to be typed
         needs_leading_space = False  # Add space before next utterance
         utterance_prefix = (
@@ -1805,8 +1940,8 @@ class VoiceTyping:
             # Drain all available chunks in a batch
             chunks = []
             try:
-                chunk = self.streaming_queue.get(timeout=0.1)
-                chunks.append(chunk)
+                item = self.streaming_queue.get(timeout=0.04)
+                chunks.append(item)
             except queue.Empty:
                 # No new audio - but check if we have a pending partial to type
                 if pending_partial:
@@ -1822,31 +1957,48 @@ class VoiceTyping:
                 except queue.Empty:
                     break
 
+            if self.streaming_enabled and self.streaming_stt is None:
+                self._recover_streaming_backend("missing streaming backend")
+
             if not self.streaming_enabled or self.streaming_stt is None:
                 continue
 
-            # Feed all chunks to sherpa-onnx
+            # Feed all chunks to the active streaming backend. Realtime services
+            # such as Nemotron NIM can close idle websockets while the local mic
+            # stream stays alive; never let that kill this worker thread.
             endpoint_hit = False
             endpoint_idx = -1
-            for idx, chunk in enumerate(chunks):
-                streaming_audio_buffer.append(chunk.copy())
-                partial = self.streaming_stt.feed_chunk(chunk)
-                if partial:
-                    # Set utterance prefix once at start of new utterance
-                    if needs_leading_space:
-                        utterance_prefix = " "
-                        needs_leading_space = False
-                    # Always apply prefix so LCP diff stays consistent
-                    pending_partial = utterance_prefix + partial
+            try:
+                for idx, item in enumerate(chunks):
+                    if isinstance(item, tuple):
+                        chunk, is_speech = item
+                    else:
+                        chunk, is_speech = item, None
+                    streaming_audio_buffer.append(chunk.copy())
+                    partial = self.streaming_stt.feed_chunk(chunk, is_speech=is_speech)
+                    if partial:
+                        # Set utterance prefix once at start of new utterance
+                        if needs_leading_space:
+                            utterance_prefix = " "
+                            needs_leading_space = False
+                        # Always apply prefix so LCP diff stays consistent
+                        pending_partial = utterance_prefix + partial
 
-                # Check for endpoint after each chunk
-                is_endpoint, final_text = self.streaming_stt.check_endpoint()
-                if is_endpoint:
-                    endpoint_hit = True
-                    endpoint_idx = idx
-                    if final_text:
-                        pending_partial = utterance_prefix + final_text
-                    break  # Stop processing more chunks after endpoint
+                    # Check for endpoint after each chunk
+                    is_endpoint, final_text = self.streaming_stt.check_endpoint()
+                    if is_endpoint:
+                        endpoint_hit = True
+                        endpoint_idx = idx
+                        if final_text:
+                            pending_partial = utterance_prefix + final_text
+                        break  # Stop processing more chunks after endpoint
+            except Exception as e:
+                self._recover_streaming_backend(e)
+                pending_partial = ""
+                utterance_prefix = ""
+                needs_leading_space = False
+                streaming_audio_buffer = []
+                continue
 
             # Type the pending partial if enough time has passed
             now = time.time()
@@ -1868,42 +2020,11 @@ class VoiceTyping:
                     self.current_streaming_text = ""
 
                 if streamed:
-                    refinement_text = streamed.lstrip()
-                    # Preserve leading space for inter-utterance spacing
-                    space_prefix = streamed[: len(streamed) - len(refinement_text)]
-
-                    if (
-                        self.ibus_client.is_available
-                        and self.refinement_enabled
-                        and refinement_text
-                    ):
-                        # Keep text as preedit until refinement commits.
-                        # Preedit is plain in browsers (no underline), underlined in terminals.
-                        self._pending_refinement_text = refinement_text
-                        self._pending_refinement_prefix = space_prefix
-                    elif self.ibus_client.is_available:
-                        # IBus without refinement: commit immediately
-                        self.ibus_client.send_commit(space_prefix + refinement_text)
-
-                    # Queue for refinement
-                    if self.refinement_enabled and refinement_text:
-                        audio_copy = streaming_audio_buffer.copy()
-                        self._enqueue_transcription(
-                            audio_copy, streaming_text=refinement_text
-                        )
-                    self._log(
-                        f"streaming_endpoint text='{streamed}' chunks={len(streaming_audio_buffer)}"
+                    self._finalize_streaming_utterance(
+                        streamed,
+                        streaming_audio_buffer,
+                        log_event="streaming_endpoint",
                     )
-                    # Track for scratch-that
-                    self.typing_history.append((streamed, len(streamed)))
-                    if len(self.typing_history) > self.max_history:
-                        self.typing_history.pop(0)
-                    # Only update previous_text from streaming if no refinement
-                    # (refinement path updates it with higher-quality text)
-                    if not self.refinement_enabled:
-                        self.previous_text = (self.previous_text + " " + streamed)[
-                            -500:
-                        ]
                     needs_leading_space = True  # Next utterance gets a space prefix
 
                 # Reset prefix for next utterance
@@ -1913,9 +2034,15 @@ class VoiceTyping:
                 # Carry over unprocessed chunks from after the endpoint
                 if endpoint_idx >= 0 and endpoint_idx + 1 < len(chunks):
                     remaining = chunks[endpoint_idx + 1 :]
-                    for leftover in remaining:
+                    for leftover_item in remaining:
+                        if isinstance(leftover_item, tuple):
+                            leftover, leftover_is_speech = leftover_item
+                        else:
+                            leftover, leftover_is_speech = leftover_item, None
                         streaming_audio_buffer.append(leftover.copy())
-                        self.streaming_stt.feed_chunk(leftover)
+                        self.streaming_stt.feed_chunk(
+                            leftover, is_speech=leftover_is_speech
+                        )
 
             # Prevent unbounded buffer growth
             max_streaming_chunks = int(
@@ -1930,16 +2057,68 @@ class VoiceTyping:
                     streamed = self.current_streaming_text
                     self.current_streaming_text = ""
                 if streamed:
-                    audio_copy = streaming_audio_buffer.copy()
-                    self._enqueue_transcription(audio_copy, streaming_text=streamed)
+                    self._finalize_streaming_utterance(
+                        streamed,
+                        streaming_audio_buffer,
+                        log_event="streaming_flush",
+                    )
+                    needs_leading_space = True
                 streaming_audio_buffer = []
                 self.streaming_stt.reset()
+
+    def _recover_streaming_backend(self, reason):
+        """Reconnect the streaming backend without killing the audio process."""
+        if str(reason) == "resume":
+            print("🔄 Refreshing streaming STT backend after pause...")
+        else:
+            print(f"⚠️  Streaming STT backend error: {reason}; reconnecting...")
+        self._log(f"streaming_backend_reconnect reason={reason}", level="warning")
+
+        try:
+            if self.streaming_stt is not None:
+                self.streaming_stt.close()
+        except Exception:
+            pass
+
+        with self.streaming_lock:
+            self.current_streaming_text = ""
+            self.visible_streaming_text = ""
+
+        try:
+            while True:
+                self.streaming_queue.get_nowait()
+                self.streaming_queue.task_done()
+        except queue.Empty:
+            pass
+        except Exception:
+            pass
+
+        try:
+            self.streaming_stt = StreamingSTT(
+                model_name=self.streaming_model,
+                sample_rate=self.sample_rate,
+                device=self.device,
+            )
+            self.streaming_stt.create_recognizer()
+            print("✅ Streaming STT backend reconnected")
+            self._log("streaming_backend_reconnected")
+        except Exception as reconnect_error:
+            self.streaming_stt = None
+            print(f"❌ Streaming STT reconnect failed: {reconnect_error}")
+            self._log(
+                f"streaming_backend_reconnect_failed error={reconnect_error}",
+                level="error",
+            )
+            time.sleep(1.0)
 
     def _type_streaming_partial(self, new_partial: str):
         """Incrementally type streaming partial results.
 
-        With IBus: updates preedit text atomically (no backspace needed).
-        Without IBus: uses LCP diff with backspace correction via evdev.
+        With IBus surrounding-text support: update preedit text atomically.
+        Otherwise: commit a stable prefix and keep a small mutable tail. For
+        clients that support IBus surrounding-text, bounded mid-utterance
+        replacements are allowed to avoid long visible stalls when the
+        recognizer revises earlier words.
         """
         with self.streaming_lock:
             new_partial = new_partial.lower()
@@ -1948,37 +2127,107 @@ class VoiceTyping:
             if not new_partial or new_partial == old_text:
                 return
 
-            # If refinement is still pending from previous utterance, commit it now
-            if self._pending_refinement_text and self.ibus_client.is_available:
-                prefix = self._pending_refinement_prefix
-                self.ibus_client.send_commit(prefix + self._pending_refinement_text)
-                self._pending_refinement_text = None
-                self._pending_refinement_prefix = ""
+            self.current_streaming_text = new_partial
+
             # IBus path: atomic preedit update (no LCP diff needed)
-            if self.ibus_client.is_available and self.ibus_client.send_preedit(
+            if self._streaming_preedit_enabled() and self.ibus_client.send_preedit(
                 new_partial
             ):
-                self.current_streaming_text = new_partial
                 return
 
-            # Evdev fallback: LCP diff with backspace correction
-            common_len = 0
-            for i in range(min(len(old_text), len(new_partial))):
-                if old_text[i] == new_partial[i]:
-                    common_len = i + 1
-                else:
-                    break
+            stable_text = self._stable_streaming_prefix(new_partial)
+            old_visible = self.visible_streaming_text
+            if not stable_text or stable_text == old_visible:
+                return
 
-            chars_to_delete = len(old_text) - common_len
-            new_chars = new_partial[common_len:]
+            # Stable partial mode is append-only by default. If the recognizer
+            # revises text inside the visible prefix, only allow a bounded
+            # mid-utterance rewrite when the focused client supports atomic
+            # surrounding-text replacement through IBus.
+            if old_visible and not stable_text.startswith(old_visible):
+                chars_to_delete, _ = self._compute_replacement(old_visible, stable_text)
+                if (
+                    self.ibus_client.is_available
+                    and self.ibus_client.supports_surrounding_text
+                    and chars_to_delete <= self.streaming_preview_max_replace_chars
+                ):
+                    self._replace_typed_text(old_visible, stable_text)
+                    self.visible_streaming_text = stable_text
+                    return
+                self._log(
+                    "streaming_partial_skip "
+                    f"old='{old_visible}' new='{stable_text}' "
+                    f"delete={chars_to_delete} reason=non_monotonic"
+                )
+                return
 
-            if chars_to_delete > 0:
-                self._send_backspaces(chars_to_delete)
+            suffix = stable_text[len(old_visible) :]
+            if not suffix:
+                return
 
-            if new_chars:
-                self._type_raw(new_chars)
+            self._type_raw(suffix)
+            self.visible_streaming_text = stable_text
 
-            self.current_streaming_text = new_partial
+    def _streaming_preedit_enabled(self) -> bool:
+        """Return True when live preedit is the best available display path."""
+        return (
+            getattr(self, "streaming_use_ibus_preedit", False)
+            and self.ibus_client.is_available
+            and self.ibus_client.supports_surrounding_text
+        )
+
+    def _stable_streaming_prefix(self, text: str) -> str:
+        """Return the stable prefix that is safe to commit mid-utterance."""
+        leading_len = len(text) - len(text.lstrip())
+        leading = text[:leading_len]
+        body = text[leading_len:]
+        if not body:
+            return ""
+
+        words = list(re.finditer(r"\S+", body))
+        if len(words) <= self.streaming_preview_tail_words:
+            return ""
+
+        stable_end = words[-self.streaming_preview_tail_words].start()
+        stable_body = body[:stable_end]
+        if not stable_body.strip():
+            return ""
+
+        if not stable_body.endswith(" "):
+            stable_body = stable_body.rstrip() + " "
+        return leading + stable_body
+
+    def _finalize_streaming_utterance(
+        self, streamed: str, streaming_audio_buffer, log_event: str
+    ):
+        """Commit a completed streaming utterance and optionally queue correction."""
+        refinement_text = streamed.lstrip()
+        committed_text = streamed
+        visible_text = self.visible_streaming_text
+        self.visible_streaming_text = ""
+
+        if self._streaming_preedit_enabled():
+            self.ibus_client.send_preedit("")
+        if visible_text:
+            self._replace_typed_text(visible_text, committed_text)
+        elif self.ibus_client.is_available:
+            if not self.ibus_client.send_commit(committed_text):
+                self._type_raw(committed_text)
+        else:
+            self._type_raw(committed_text)
+
+        if self.refinement_enabled and refinement_text:
+            audio_copy = streaming_audio_buffer.copy()
+            self._enqueue_transcription(audio_copy, streaming_text=refinement_text)
+
+        self._log(f"{log_event} text='{streamed}' chunks={len(streaming_audio_buffer)}")
+
+        self.typing_history.append((streamed, len(streamed)))
+        if len(self.typing_history) > self.max_history:
+            self.typing_history.pop(0)
+
+        if not self.refinement_enabled:
+            self.previous_text = (self.previous_text + " " + streamed)[-500:]
 
     def _send_backspaces(self, count: int):
         """Send backspace key presses."""
@@ -2023,19 +2272,56 @@ class VoiceTyping:
         except Exception as e:
             print(f"Type error: {e}")
 
+    @staticmethod
+    def _compute_replacement(old_text: str, new_text: str) -> tuple[int, str]:
+        """Compute a minimal suffix replacement from old_text to new_text."""
+        old_lower = old_text.lower()
+        new_lower = new_text.lower()
+        common_len = 0
+        for i in range(min(len(old_lower), len(new_lower))):
+            if old_lower[i] == new_lower[i]:
+                common_len = i + 1
+            else:
+                break
+
+        chars_to_delete = len(old_text) - common_len
+        return chars_to_delete, new_text[common_len:]
+
     def _replace_typed_text(self, old_text: str, new_text: str):
-        """Replace previously typed text with new text (for refinement corrections)."""
+        """Replace previously typed text with new text after an optional correction."""
         if not old_text:
             self._type_raw(new_text)
-            return
+            return 0
+
+        chars_to_delete, new_suffix = self._compute_replacement(old_text, new_text)
+        if chars_to_delete <= 0 and not new_suffix:
+            return 0
+
+        if self.ibus_client.is_available and self.ibus_client.supports_surrounding_text:
+            if self.ibus_client.send_replace(chars_to_delete, new_suffix):
+                return chars_to_delete
 
         if self.key_injector:
             # Single write() syscall: backspace + retype in one kernel call
-            self.key_injector.replace_text(len(old_text), new_text)
-        else:
-            self._send_backspaces(len(old_text))
-            if new_text:
-                self._type_raw(new_text)
+            self.key_injector.replace_text(chars_to_delete, new_suffix)
+            return chars_to_delete
+
+        if chars_to_delete > 0:
+            self._send_backspaces(chars_to_delete)
+        if new_suffix:
+            self._type_raw(new_suffix)
+        return chars_to_delete
+
+    def _update_last_typed_history(self, old_text: str, new_text: str):
+        """Keep scratch-that history aligned with the most recent correction."""
+        if not self.typing_history:
+            return
+
+        last_text, _ = self.typing_history[-1]
+        if last_text.strip() != old_text.strip():
+            return
+
+        self.typing_history[-1] = (new_text, len(new_text))
 
     def _ydotool_env(self):
         """Get environment with ydotool socket path set"""
@@ -2197,11 +2483,15 @@ class VoiceTyping:
                 )
                 self.streaming_thread.start()
                 mode = (
-                    "streaming + refinement"
+                    "streaming + post-commit correction"
                     if self.refinement_enabled
                     else "streaming-only"
                 )
                 print(f"🔊 Streaming STT active ({mode})")
+                display_mode = (
+                    "IBus preedit" if self._streaming_preedit_enabled() else "stable partial commits"
+                )
+                print(f"📝 Streaming display mode: {display_mode}")
 
             # Start audio stream
             self.stream.start_stream()
@@ -2298,6 +2588,11 @@ class VoiceTyping:
             self.streaming_thread.join(timeout=2.0)
         if self.transcription_thread and self.transcription_thread.is_alive():
             self.transcription_thread.join(timeout=2.0)
+        if self.streaming_stt:
+            try:
+                self.streaming_stt.close()
+            except:
+                pass
 
         if self.stream:
             try:
@@ -2340,6 +2635,13 @@ def _build_defaults(config: dict) -> dict:
     normalized = dict(config)
     if "no_adaptive_vad" in normalized and "adaptive_vad" not in normalized:
         normalized["adaptive_vad"] = not bool(normalized["no_adaptive_vad"])
+    if (
+        "refinement" in normalized
+        and "post_commit_correction" not in normalized
+    ):
+        normalized["post_commit_correction"] = normalized["refinement"]
+    if "refinement_model" in normalized and "correction_model" not in normalized:
+        normalized["correction_model"] = normalized["refinement_model"]
     merged.update(normalized)
     return merged
 
@@ -2358,18 +2660,9 @@ def _build_parser(defaults: dict) -> argparse.ArgumentParser:
     parser.add_argument(
         "--model",
         default=defaults["model"],
-        choices=[
-            "tiny",
-            "base",
-            "small",
-            "medium",
-            "large",
-            "distil-large-v3",
-            "distil-medium",
-            "large-v3",
-            "large-v3-turbo",
-        ],
-        help="Whisper model size",
+        choices=WHISPER_MODELS
+        + (get_offline_model_names() if STT_HELPERS_AVAILABLE else []),
+        help="Batch model (Whisper or sherpa offline model such as parakeet-tdt-0.6b-v2)",
     )
     parser.add_argument(
         "--device",
@@ -2573,24 +2866,39 @@ def _build_parser(defaults: dict) -> argparse.ArgumentParser:
         "--streaming",
         action=argparse.BooleanOptionalAction,
         default=defaults["streaming"],
-        help="Enable streaming STT (sherpa-onnx, words appear as you speak)",
+        help="Enable streaming STT (Parakeet CTC, Moonshine native, or sherpa zipformer)",
     )
     parser.add_argument(
         "--streaming-model",
         default=defaults["streaming_model"],
-        choices=["zipformer-en", "zipformer-en-20M"],
-        help="Streaming model (zipformer-en=80MB accurate, zipformer-en-20M=20MB fast)",
+        choices=get_streaming_model_names() if STT_HELPERS_AVAILABLE else None,
+        help="Streaming model (Parakeet CTC, Moonshine native, or sherpa zipformer)",
+    )
+    parser.add_argument(
+        "--post-commit-correction",
+        action=argparse.BooleanOptionalAction,
+        dest="post_commit_correction",
+        default=defaults["post_commit_correction"],
+        help="Enable optional offline post-commit correction after streaming (Parakeet by default, Whisper still supported)",
     )
     parser.add_argument(
         "--refinement",
-        action=argparse.BooleanOptionalAction,
-        default=defaults["refinement"],
-        help="Enable Whisper refinement after streaming (adds punctuation/casing, needs GPU)",
+        dest="post_commit_correction",
+        action="store_true",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
+        "--no-refinement",
+        dest="post_commit_correction",
+        action="store_false",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--correction-model",
         "--refinement-model",
-        default=defaults["refinement_model"],
-        help="Whisper model for refinement pass (default: large-v3-turbo)",
+        dest="correction_model",
+        default=defaults["correction_model"],
+        help="Post-commit correction model (Whisper or sherpa offline model; default: parakeet-tdt-0.6b-v2)",
     )
     return parser
 
@@ -2682,8 +2990,8 @@ def main():
         viz_hide_delay=args.viz_hide_delay,
         streaming_enabled=args.streaming,
         streaming_model=args.streaming_model,
-        refinement_enabled=args.refinement,
-        refinement_model=args.refinement_model,
+        post_commit_correction_enabled=args.post_commit_correction,
+        correction_model=args.correction_model,
     )
 
     # Handle graceful shutdown

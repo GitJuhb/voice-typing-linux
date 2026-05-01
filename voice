@@ -3,6 +3,10 @@
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 IBUS_PID=""
+RUNTIME_ENV="${XDG_CONFIG_HOME:-$HOME/.config}/voice-typing/runtime.env"
+IBUS_COMPONENT_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/ibus/component"
+IBUS_COMPONENT_LINK="$IBUS_COMPONENT_DIR/voice-typing-ibus.xml"
+REPO_IBUS_COMPONENT="$SCRIPT_DIR/voice-typing-ibus.xml"
 
 cleanup() {
     if [ -n "$IBUS_PID" ] && kill -0 "$IBUS_PID" 2>/dev/null; then
@@ -12,10 +16,27 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# Default: streaming with large-v3-turbo on CUDA
+if [ -f "$RUNTIME_ENV" ]; then
+    set -a
+    # shellcheck source=/dev/null
+    . "$RUNTIME_ENV"
+    set +a
+fi
+
+install -d -m 755 "$IBUS_COMPONENT_DIR"
+if [ -L "$IBUS_COMPONENT_LINK" ] || [ ! -e "$IBUS_COMPONENT_LINK" ]; then
+    ln -sfn "$REPO_IBUS_COMPONENT" "$IBUS_COMPONENT_LINK"
+fi
+
+if ! pgrep -x ibus-daemon >/dev/null 2>&1; then
+    ibus-daemon -drx >/dev/null 2>&1
+    sleep 1
+fi
+
+# Default: streaming on CUDA with the branch's configured streaming backend
 DEFAULT_ARGS=""
 if [ $# -eq 0 ]; then
-    DEFAULT_ARGS="--streaming --model large-v3-turbo --device cuda --refinement"
+    DEFAULT_ARGS="--streaming --device cuda"
 fi
 
 # Kill any stale IBus engine instances

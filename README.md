@@ -1,13 +1,13 @@
 # Voice Typing for Linux
 
-Fast, accurate voice typing for Linux with IBus atomic text insertion, two-pass streaming STT, and CUDA acceleration. Works on Wayland and X11 — in terminals, browsers, and every app.
+Fast, accurate voice typing for Linux with IBus atomic text insertion, streaming STT, and optional post-commit correction. The default streaming path is now NVIDIA Riva ASR NIM with `nemotron-asr-streaming-nim`, while local Parakeet CTC remains available as the zero-service fallback. Works on Wayland and X11 — in terminals, browsers, and every app.
 
 ## Features
 
 - **IBus input method engine** — Atomic text insertion via `commit_text`. No key injection lag, no garbled output in terminals. One unified path for every app.
-- **Two-pass streaming STT** — sherpa-onnx streams words as you speak (~100ms latency), then faster-whisper turbo refines for accuracy. Text appears instantly, corrections happen seamlessly.
-- **Preedit-until-refinement** — Streaming partials stay as preedit (preview text) until Whisper confirms or corrects them. No visible backspacing or flickering.
-- **GPU acceleration** — TF32 Tensor Cores, cudnn benchmark mode, pinned memory transfers, model warm-up. Refinement takes ~0.1-0.2s on CUDA.
+- **Streaming-first STT** — NVIDIA Riva ASR NIM `nemotron-asr-streaming-nim` is now the default streaming backend. Local buffered `parakeet-ctc-0.6b` remains available as the zero-service fallback, older Parakeet CTC NIM profiles remain selectable, Moonshine native remains selectable, Parakeet TDT remains available as an optional post-commit correction model, and zipformer remains available as a sherpa fallback.
+- **Immediate IBus commit** — Endpoint text commits immediately on IBus. Optional post-commit correction can replace the last utterance afterward when enabled.
+- **GPU acceleration** — TF32 Tensor Cores, cudnn benchmark mode, pinned memory transfers, model warm-up.
 - **Pre-recording buffer** — 600ms circular buffer captures speech before VAD triggers. Never miss the first word.
 - **Voice commands** — Window management, text editing, app launching, web search. Automatic dictation vs command disambiguation.
 - **Audio visualizer** — GTK4 spectrum analyzer overlay, auto-shows on speech, auto-hides on silence.
@@ -42,8 +42,8 @@ Two processes communicate via Unix socket:
                         │         │                                   │
                         │         ▼                                   │
                         │   ┌──────────┐     ┌───────────────────┐    │
-                        │   │ sherpa-  │     │ faster-whisper    │    │
-                        │   │ onnx     │────▶│ turbo (refine)    │    │
+                        │   │ Moonshine│     │ sherpa-onnx       │    │
+                        │   │ native   │────▶│ parakeet optional │    │
                         │   │ (stream) │     │ (GPU/CPU)         │    │
                         │   └────┬─────┘     └────────┬──────────┘    │
                         │        │ partials           │ final text    │
@@ -67,9 +67,9 @@ Two processes communicate via Unix socket:
                               (Ghostty, Firefox, etc.)
 ```
 
-**Pass 1 (sherpa-onnx):** Streams each 20ms audio chunk through a zipformer transducer. Partial results update the IBus preedit text in real-time.
+**Pass 1 (streaming):** The default streaming path is NVIDIA Riva ASR NIM with `nemotron-asr-streaming-nim`. Local buffered `parakeet-ctc-0.6b` remains the fallback that works without any external service. The older Parakeet CTC NIM profiles remain available as compatibility baselines. Moonshine native remains available for local true-online partials, and zipformer remains available as the sherpa true-online fallback.
 
-**Pass 2 (faster-whisper turbo):** On endpoint detection (silence), accumulated audio goes to Whisper large-v3-turbo. The preedit clears and the refined text commits atomically. If streaming and refined text match, it confirms. If they differ, it corrects — no backspacing, no flicker.
+**Pass 2 (optional post-commit correction):** When enabled, endpoint audio can go to Parakeet TDT after the streaming text is already committed. If the correction is accepted, the last utterance is replaced in place.
 
 **Fallback:** If the IBus engine isn't running, falls back to direct uinput key injection via python-evdev (sub-millisecond), then ydotool, then xdotool.
 
@@ -113,12 +113,24 @@ When the IBus engine is running, voice typing auto-detects it and routes all tex
 # Default batch mode (speak → pause → text appears)
 ./voice
 
-# Streaming mode (words appear as you speak, refined on pause)
+# Streaming mode (words appear as you speak)
 ./voice --streaming
-./voice --streaming --device cuda --model large-v3-turbo
+./voice --streaming --streaming-model parakeet-ctc-0.6b
+./voice --streaming --post-commit-correction --device cuda
+./voice --streaming --post-commit-correction --correction-model large-v3-turbo
 
-# Smaller streaming model (~20MB instead of ~80MB)
+# Streaming model selection
+./voice --streaming --streaming-model parakeet-ctc-0.6b
+VOICE_NIM_URL=http://127.0.0.1:9000 ./voice --streaming --streaming-model nemotron-asr-streaming-nim
+VOICE_NIM_URL=http://127.0.0.1:9000 ./voice --streaming --streaming-model parakeet-ctc-0.6b-nim
+VOICE_NIM_URL=http://127.0.0.1:9000 ./voice --streaming --streaming-model parakeet-ctc-1.1b-nim
 ./voice --streaming --streaming-model zipformer-en-20M
+./voice --streaming --streaming-model moonshine-tiny-streaming-en
+./voice --streaming --streaming-model moonshine-small-streaming-en
+./voice --streaming --streaming-model moonshine-medium-streaming-en
+
+# Batch Parakeet
+./voice --model parakeet-tdt-0.6b-v2 --device cuda
 
 # Audio visualizer overlay
 ./voice --viz --viz-position top-right
@@ -150,14 +162,52 @@ When the IBus engine is running, voice typing auto-detects it and routes all tex
 
 First run downloads models automatically to `~/.cache/`.
 
-| Model | Size | Speed | Use Case |
-|-------|------|-------|----------|
-| tiny | 39 MB | Fastest | Quick notes |
-| base | 74 MB | Fast | General typing |
-| small | 244 MB | Moderate | Good balance |
-| large-v3-turbo | ~1.5 GB | Fast (GPU) | **Best for streaming refinement** |
+| Model | Size | Backend | Use Case |
+|-------|------|---------|----------|
+| tiny / base / small / medium / large-v3-turbo | 39 MB to 1.5 GB | faster-whisper | Multilingual batch / fallback |
+| parakeet-tdt-0.6b-v2 | ~300 MB | sherpa-onnx | Default English batch/post-commit correction |
 
-Streaming models (sherpa-onnx): `zipformer-en` (~80MB), `zipformer-en-20M` (~20MB).
+Streaming models:
+- `parakeet-ctc-0.6b` (default, buffered local streaming)
+- `nemotron-asr-streaming-nim` (default and recommended NVIDIA Riva ASR NIM realtime backend)
+- `parakeet-ctc-0.6b` (buffered local fallback)
+- `parakeet-ctc-0.6b-nim` (NVIDIA Riva ASR NIM realtime websocket backend)
+- `parakeet-ctc-1.1b-nim` (older Parakeet CTC NIM baseline on large cards)
+- `moonshine-medium-streaming-en` (native streaming)
+- `moonshine-small-streaming-en` (smaller native streaming)
+- `moonshine-tiny-streaming-en` (smallest native streaming)
+- `zipformer-en` (sherpa true-online fallback)
+- `zipformer-en-20M` (small sherpa true-online fallback)
+
+### NVIDIA Nemotron NIM
+
+Best GPU streaming setup on a large NVIDIA card:
+
+```bash
+export NGC_API_KEY=<your-ngc-key>
+docker login nvcr.io
+
+docker run -it --rm --name=nemotron-asr-streaming \
+  --runtime=nvidia \
+  --gpus '"device=0"' \
+  --shm-size=8GB \
+  -e NGC_API_KEY \
+  -e NIM_HTTP_API_PORT=9000 \
+  -e NIM_GRPC_API_PORT=50051 \
+  -e NIM_TAGS_SELECTOR=mode=str \
+  -p 9000:9000 \
+  -p 50051:50051 \
+  nvcr.io/nim/nvidia/nemotron-asr-streaming:latest
+
+curl http://localhost:9000/v1/health/ready
+VOICE_NIM_URL=http://127.0.0.1:9000 ./voice --streaming --streaming-model nemotron-asr-streaming-nim --device cuda
+```
+
+Older Parakeet CTC NIM profiles remain supported when you explicitly select `parakeet-ctc-0.6b-nim` or `parakeet-ctc-1.1b-nim`.
+
+This backend talks to NIM over the official realtime websocket API:
+- `POST /v1/realtime/transcription_sessions`
+- `WS /v1/realtime?intent=transcription`
 
 ## Voice Commands
 
@@ -184,16 +234,18 @@ Custom commands via `~/.config/voice-typing/commands.yaml`.
 Config file: `~/.config/voice-typing/config.yaml`
 
 ```yaml
-model: large-v3-turbo
+model: parakeet-tdt-0.6b-v2
 device: cuda
 streaming: true
-streaming_model: zipformer-en
+streaming_model: nemotron-asr-streaming-nim
+post_commit_correction: false
+correction_model: parakeet-tdt-0.6b-v2
 commands: true
 noise_gate: true
 adaptive_vad: true
 ```
 
-Environment overrides (prefix `VOICE_`): `VOICE_MODEL`, `VOICE_DEVICE`, `VOICE_HOTKEY`, `VOICE_STREAMING`, `VOICE_STREAMING_MODEL`, `VOICE_REFINEMENT_MODEL`, `VOICE_COMMANDS`, `VOICE_NOISE_GATE`, `VOICE_PTT`, `VOICE_LOG_FILE`, `VOICE_ADAPTIVE_VAD`.
+Environment overrides (prefix `VOICE_`): `VOICE_MODEL`, `VOICE_DEVICE`, `VOICE_HOTKEY`, `VOICE_STREAMING`, `VOICE_STREAMING_MODEL`, `VOICE_POST_COMMIT_CORRECTION`, `VOICE_CORRECTION_MODEL`, `VOICE_COMMANDS`, `VOICE_NOISE_GATE`, `VOICE_PTT`, `VOICE_LOG_FILE`, `VOICE_ADAPTIVE_VAD`, `VOICE_NIM_URL`, `VOICE_NIM_API_KEY`. Legacy `VOICE_REFINEMENT*` env vars are still accepted.
 
 ## Project Structure
 
@@ -205,7 +257,7 @@ voice-typing-linux/
 ├── ibus_voice_engine.py       # IBus input method engine (separate process)
 ├── ibus-engine-voice-typing   # IBus engine launcher script
 ├── voice-typing-ibus.xml      # IBus component descriptor
-├── streaming_stt.py           # sherpa-onnx streaming wrapper
+├── streaming_stt.py           # Streaming backends + offline model wrappers
 ├── commands.py                # Voice command detection and execution
 ├── audio_visualizer.py        # GTK4 spectrum analyzer overlay
 ├── shell.nix                  # Nix environment (Python + system deps)
@@ -222,8 +274,8 @@ voice-typing-linux/
 Up to 6 concurrent threads:
 
 1. **Audio callback** (PyAudio) — Non-blocking VAD + pre-buffer, queues recordings
-2. **Transcription worker** — Whisper inference, refinement comparison
-3. **Streaming worker** — sherpa-onnx real-time partials, endpoint detection
+2. **Transcription worker** — Offline model inference, optional post-commit correction comparison
+3. **Streaming worker** — Parakeet CTC buffered streaming, Moonshine native, or zipformer partials with endpoint detection
 4. **Hotkey listener** (pynput) — Global F12 toggle
 5. **Socket listener** — Wayland fallback, accepts toggle/pause/resume
 6. **Visualizer** (GTK4) — FFT spectrum overlay at ~30fps
@@ -261,8 +313,8 @@ sudo usermod -aG input $USER  # Then logout/login
 
 ## Technical Details
 
-- **Speech Recognition:** OpenAI Whisper via faster-whisper (CTranslate2)
-- **Streaming STT:** sherpa-onnx zipformer transducer
+- **Speech Recognition:** sherpa-onnx Parakeet TDT (default) or Whisper via faster-whisper
+- **Streaming STT:** Parakeet CTC by default, with Moonshine native and zipformer available as alternatives
 - **Text Insertion:** IBus commit_text (primary), evdev uinput (fallback), ydotool/xdotool (legacy)
 - **Audio:** PyAudio + PortAudio, 16kHz mono, 20ms chunks
 - **VAD:** WebRTC Voice Activity Detection (aggressiveness 2)
@@ -277,6 +329,7 @@ MIT License — see [LICENSE](LICENSE)
 
 - [OpenAI Whisper](https://github.com/openai/whisper) — speech recognition model
 - [faster-whisper](https://github.com/guillaumekln/faster-whisper) — CTranslate2 optimized inference
-- [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) — streaming speech recognition
+- [Moonshine Voice](https://github.com/moonshine-ai/moonshine) — native streaming speech recognition
+- [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) — streaming and offline speech recognition
 - [IBus](https://github.com/ibus/ibus) — intelligent input bus for Linux
 - [RealtimeSTT](https://github.com/KoljaB/RealtimeSTT) — pre-buffer technique inspiration

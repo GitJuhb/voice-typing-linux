@@ -19,6 +19,7 @@ pkgs.mkShell {
     netcat     # Socket toggle (voice-toggle)
     xbindkeys  # Wayland hotkey fallback
     portaudio  # For pyaudio
+    libsndfile # For librosa/soundfile-backed feature extraction
     
     # For pyautogui
     scrot  # Screenshot tool
@@ -38,10 +39,10 @@ pkgs.mkShell {
     # IBus input method framework (atomic text insertion)
     ibus
 
-    # Streaming STT (sherpa-onnx uses onnxruntime)
+    # sherpa-onnx offline STT (uses onnxruntime)
     onnxruntime
 
-    # CUDA inference (cuDNN for faster-whisper/CTranslate2)
+    # CUDA inference (cuDNN for faster-whisper + ONNX Runtime GPU)
     cudaPackages.cudnn
 
     # Build dependencies
@@ -54,7 +55,7 @@ pkgs.mkShell {
   
   shellHook = ''
     # Set up library paths
-    export LD_LIBRARY_PATH="/run/opengl-driver/lib:${pkgs.cudaPackages.cudnn.lib}/lib:${pkgs.stdenv.cc.cc.lib}/lib:${pkgs.zlib}/lib:${pkgs.onnxruntime}/lib:$LD_LIBRARY_PATH"
+    export LD_LIBRARY_PATH="/run/opengl-driver/lib:${pkgs.cudaPackages.cudnn.lib}/lib:${pkgs.stdenv.cc.cc.lib}/lib:${pkgs.zlib}/lib:${pkgs.onnxruntime}/lib:${pkgs.libsndfile}/lib:$LD_LIBRARY_PATH"
 
     # Linux headers for python-evdev build
     export EVDEV_HEADERS="${pkgs.linuxHeaders}/include/linux/input.h:${pkgs.linuxHeaders}/include/linux/input-event-codes.h"
@@ -77,14 +78,13 @@ pkgs.mkShell {
     
     # Install Python packages only when requirements change
     echo "Checking Python packages..."
-    pip install --upgrade pip
 
     if [ -f requirements.txt ]; then
       REQ_HASH="$(sha256sum requirements.txt | awk '{print $1}')"
       REQ_FILE=".venv/.requirements.sha"
       if [ ! -f "$REQ_FILE" ] || [ "$(cat "$REQ_FILE")" != "$REQ_HASH" ]; then
         echo "Installing/updating Python packages..."
-        pip install -r requirements.txt
+        python -m pip install --disable-pip-version-check -r requirements.txt
         echo "$REQ_HASH" > "$REQ_FILE"
       fi
     fi

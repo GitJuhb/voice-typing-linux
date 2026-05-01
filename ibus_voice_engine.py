@@ -9,7 +9,8 @@ This eliminates the need for uinput/ydotool key injection and works uniformly
 across terminals (Ghostty, kitty) and GUI apps (Firefox, editors).
 
 Architecture:
-  enhanced-voice-typing.py --[socket]--> ibus_voice_engine.py --[IBus API]--> focused app
+  enhanced-voice-typing.py --[socket]--> ibus_voice_engine.py
+  --[IBus API]--> focused app
 
 Socket protocol (newline-terminated commands):
   preedit:TEXT     - Show TEXT as underlined preedit (streaming partials)
@@ -27,7 +28,7 @@ import atexit
 import gi
 
 gi.require_version("IBus", "1.0")
-from gi.repository import IBus, GLib
+from gi.repository import IBus, GLib  # noqa: E402
 
 RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR", "/tmp")
 IBUS_SOCKET_PATH = os.path.join(RUNTIME_DIR, f"voice-typing-ibus-{os.getuid()}.sock")
@@ -35,6 +36,7 @@ IBUS_CAPS_PATH = os.path.join(RUNTIME_DIR, f"voice-typing-ibus-caps-{os.getuid()
 
 # Global reference to the active engine instance (set by factory)
 _active_engine = None
+_factory = None
 
 
 class VoiceTypingEngine(IBus.Engine):
@@ -48,7 +50,10 @@ class VoiceTypingEngine(IBus.Engine):
         self._surrounding = False
 
     def do_process_key_event(self, keyval, keycode, state):
-        """Pass through all keyboard events — we only inject text, not intercept keys."""
+        """Pass through all keyboard events.
+
+        We only inject text here; we do not intercept keys.
+        """
         return False
 
     def do_enable(self):
@@ -193,7 +198,9 @@ def _handle_client(conn):
             buf += data
             while b"\n" in buf:
                 line, buf = buf.split(b"\n", 1)
-                line_str = line.decode("utf-8", errors="replace").strip()
+                # Preserve payload whitespace. Streaming suffix commits depend on
+                # leading/trailing spaces remaining intact across the socket hop.
+                line_str = line.decode("utf-8", errors="replace")
                 if line_str:
                     _handle_socket_command(line_str)
     except Exception:
@@ -243,6 +250,8 @@ def _cleanup():
 
 
 def main():
+    global _factory
+
     IBus.init()
 
     bus = IBus.Bus()
@@ -273,7 +282,7 @@ def main():
     )
     component.add_engine(engine_desc)
 
-    factory = VoiceTypingEngineFactory(bus)
+    _factory = VoiceTypingEngineFactory(bus)
     rc = bus.register_component(component)
     print(f"register_component: {rc}")
     rn = bus.request_name("org.freedesktop.IBus.VoiceTyping", 0)

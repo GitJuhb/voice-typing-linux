@@ -19,7 +19,7 @@ def read_requirements():
 setup(
     name="voice-typing-linux",
     version="0.1.0",
-    description="Voice typing for Linux using faster-whisper",
+    description="Voice typing for Linux with streaming STT backends and optional offline correction",
     scripts=["voice", "voice-toggle", "enhanced-voice-typing.py"],
     install_requires=read_requirements(),
 )

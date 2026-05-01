@@ -1,6 +1,22 @@
 #!/bin/bash
-# Toggle voice typing pause/resume via Unix socket
-# Use this for Wayland or bind to a hotkey in your compositor
+# Control voice typing pause/resume via Unix socket.
+# Use this for Wayland hotkeys or app integrations such as Openline.
+
+set -euo pipefail
+
+COMMAND="${1:-toggle}"
+case "$COMMAND" in
+    toggle|pause|resume|status)
+        ;;
+    -h|--help|help)
+        echo "Usage: $0 [toggle|pause|resume|status]"
+        exit 0
+        ;;
+    *)
+        echo "Usage: $0 [toggle|pause|resume|status]" >&2
+        exit 2
+        ;;
+esac
 
 RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}"
 SOCKET="${RUNTIME_DIR}/voice-typing-$(id -u).sock"
@@ -11,16 +27,72 @@ if [ ! -S "$SOCKET" ]; then
     exit 1
 fi
 
+PAYLOAD="$COMMAND"
 if [ -f "$TOKEN_FILE" ]; then
     TOKEN="$(cat "$TOKEN_FILE")"
-    echo "toggle $TOKEN" | nc -U "$SOCKET" 2>/dev/null
-else
-    echo "toggle" | nc -U "$SOCKET" 2>/dev/null
+    PAYLOAD="$COMMAND $TOKEN"
 fi
 
-if [ $? -eq 0 ]; then
-    echo "Toggled pause/resume"
-else
-    echo "Failed to send command"
+send_with_python() {
+    local python_bin=""
+    if command -v python3 >/dev/null 2>&1; then
+        python_bin="$(command -v python3)"
+    elif command -v python >/dev/null 2>&1; then
+        python_bin="$(command -v python)"
+    elif [ -x /run/current-system/sw/bin/python3 ]; then
+        python_bin=/run/current-system/sw/bin/python3
+    fi
+
+    if [ -z "$python_bin" ]; then
+        return 127
+    fi
+
+    "$python_bin" - "$SOCKET" "$PAYLOAD" <<'PY'
+import socket
+import sys
+
+path = sys.argv[1]
+payload = sys.argv[2]
+
+with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+    sock.settimeout(2.0)
+    sock.connect(path)
+    sock.sendall((payload + "\n").encode())
+    chunks = []
+    while True:
+        try:
+            data = sock.recv(4096)
+        except TimeoutError:
+            break
+        if not data:
+            break
+        chunks.append(data)
+
+sys.stdout.write(b"".join(chunks).decode(errors="replace").strip())
+PY
+}
+
+SENT=0
+RESPONSE=""
+if command -v nc >/dev/null 2>&1; then
+    if RESPONSE="$(printf '%s\n' "$PAYLOAD" | nc -U "$SOCKET" 2>/dev/null)"; then
+        SENT=1
+    fi
+fi
+
+if [ "$SENT" -eq 0 ]; then
+    if RESPONSE="$(send_with_python)"; then
+        SENT=1
+    fi
+fi
+
+if [ "$SENT" -eq 0 ]; then
+    echo "Failed to send $COMMAND" >&2
     exit 1
+fi
+
+if [ -n "$RESPONSE" ]; then
+    echo "$RESPONSE"
+else
+    echo "Sent $COMMAND"
 fi
