@@ -1,0 +1,47 @@
+Remote desktop output routing case notes (2026-05-01)
+
+Scope:
+- Branch: feature/remote-desktop-output
+- Commit: a790653 Add remote desktop output routing
+- Base/main at implementation time: 1f60fd1 Add streaming STT backends and tests
+- Goal: make local voice typing work through RustDesk/Remmina/RDP windows by routing local STT output through a remote-safe insertion path.
+
+Implementation summary:
+- Added --output-backend={auto,ibus,keys,clipboard-paste}.
+- Added --remote-mode={auto,endpoint-paste,live-keys,off} plus --remote-live-keys and --no-remote-auto shortcuts.
+- auto mode keeps IBus for normal local apps, but detects focused RustDesk/Remmina/FreeRDP/KRDC/virt-viewer/spice-gtk-style windows and switches to clipboard-paste unless live-keys is explicitly selected.
+- clipboard-paste sets the local clipboard via wl-copy/xclip/xsel and sends Ctrl+V via uinput/ydotool/xdotool; previous text clipboard is restored after a short delay when readable.
+- Streaming partials are deferred in clipboard-paste remote mode and only committed at utterance endpoint.
+- Post-commit correction is skipped for clipboard-paste remote mode to avoid destructive remote backspace/retype corrections.
+- Added uinput Ctrl+V support and xclip to shell.nix.
+- Docs updated in README.md and CLAUDE.md.
+
+Validation run:
+- python -m py_compile enhanced-voice-typing.py streaming_stt.py commands.py ibus_voice_engine.py audio_visualizer.py
+- python -m unittest tests/test_model_catalog.py
+- Result: 38 tests OK.
+
+Primary usage:
+- Recommended: ./voice --streaming --output-backend auto --remote-mode endpoint-paste
+- Force paste if auto-detect fails: ./voice --streaming --output-backend clipboard-paste
+- Opt into live key streaming: ./voice --streaming --remote-live-keys
+
+Risks / caveats:
+- RustDesk/Remmina/RDP clipboard sync must be enabled. If clipboard sync is disabled, endpoint-paste will not reach the remote session.
+- Wayland/GNOME may not expose focused-window metadata to this process. Auto-detection can fail; use --output-backend clipboard-paste as the override.
+- xdotool focus detection only works for X11/XWayland-visible clients. Hyprland and Sway are best-effort via hyprctl/swaymsg.
+- Remote clients may consume Ctrl+V differently in password fields, lock screens, UAC/elevated prompts, or secure input contexts.
+- Keyboard-layout mismatch can still affect keys/live-keys mode; clipboard-paste is safer for punctuation and symbols.
+- Live streaming through key events can lag, reorder, or corrupt text over RDP/RustDesk because partial updates may involve backspace/retype. endpoint-paste is intentionally the default remote path.
+- clipboard-paste temporarily overwrites the local clipboard. The code attempts to restore prior text clipboard contents, but non-text clipboard data may not restore and some clipboard managers may record the transient transcript.
+- Sensitive dictated text is placed on the local clipboard in clipboard-paste mode. Do not use that mode for secrets unless acceptable.
+- Post-commit correction is skipped in clipboard-paste remote mode; accuracy depends on the endpoint transcript. This is a deliberate safety tradeoff.
+- ydotool/uinput permissions still matter on Wayland for sending Ctrl+V. If paste does not trigger, check ydotoold or /dev/uinput/input-group setup.
+
+Reopen checklist:
+1. Confirm current branch/commit and whether notes were fetched: git notes show a790653
+2. Smoke test local paste into a normal editor with --output-backend clipboard-paste.
+3. Smoke test clipboard sync manually inside remote window: printf 'hello' | wl-copy; then send Ctrl+V.
+4. If auto-detect fails, inspect focused-window identity paths: hyprctl activewindow -j, swaymsg -t get_tree, or xdotool getwindowfocus/getwindowclassname/getwindowname.
+5. If text corrupts in remote, keep endpoint-paste and avoid --remote-live-keys.
+6. If clipboard is unacceptable for security/privacy, use --remote-mode live-keys and accept remote key-event reliability risk.
